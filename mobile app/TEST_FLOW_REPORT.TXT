@@ -1,0 +1,903 @@
+================================================================================
+SMART MEDICINE APP — COMPREHENSIVE TEST-FLOW REPORT (Screens + Flow Steps)
+================================================================================
+Project Root : c:\Users\borgi\Desktop\app\smart_medicine_app
+Report Date  : 2026-10-05
+Authored by  : Automated implementation report
+App Type     : Flutter (Dart) mobile app. NOT Expo. pubspec.yaml based.
+Platforms    : Android minSdk=23 (coreLibraryDesugaringEnabled=true, multidex=true),
+               iOS (DarwinNotificationDetails), web, macOS, windows, linux.
+App Icon     : assets/logo/icon.png (transparency preserved; android/iOS/web/
+               mac/win/linux buckets regenerated with flutter_launcher_icons 0.14.3).
+
+================================================================================
+SECTION 1  — SCREEN / WIDGET INVENTORY
+================================================================================
+1.1  Dart source tree (lib/)  (folder listing, critical files only)
+     |
+     +-- lib/main.dart                                MaterialApp root, GlobalKey
+     |                                                 rootNavigatorKey, /notification/
+     |                                                 medication-schedule deep-link
+     |
+     +-- lib/controllers/  (ChangeNotifier state layer)
+     |   |-- patient_controller.dart
+     |   |-- patient_dashboard_controller.dart          (hooks: onMedicationUpdated,
+     |   |                                                  onMedicationDeleted →
+     |   |                                                  reschedule notifications)
+     |   |-- medication_controller.dart                  (hooks: create/update/delete
+     |   |                                                  → schedule notification sync)
+     |   |-- schedule_controller.dart                    (hooks: create/update/delete
+     |   |                                                  → notification sync)
+     |   |-- drawer_medication_controller.dart
+     |   |-- smart_box_controller.dart                   (MedicineBox, Drawers,
+     |                                                      Sensors Aggregate TEST7,
+     |                                                      Single Drawer Sensors TEST8,
+     |                                                      OPEN / CLOSE Drawer TEST9)
+     |   |-- notification_controller.dart                (ChangeNotifier singleton,
+     |                                                      GlobalKey nav, tap push route)
+     |   `-- settings_controller.dart                    (ThemeMode System/Light/Dark
+     |                                                      SharedPref persistence +
+     |                                                      AppPalette)
+     |
+     +-- lib/services/
+     |   |-- notification_service.dart                   (flutter_local_notifications
+     |   |                                                  v17.2.4 + timezone 0.9.4
+     |   |                                                  singleton, FNV IDs, zoned
+     |   |                                                  exactAllowWhileIdle, keep-set
+     |   |                                                  stale sweep, typed JSON payload)
+     |   `-- smart_box_service.dart                       (Repo→Service domain layer for
+     |                                                      boxes, drawers, sensors, drawer
+     |                                                      commands.)
+     |
+     +-- lib/data/
+     |   |-- api_client.dart                              (existing authenticated http.
+     |   |                                                  Client + AuthStorage JWT
+     |   |                                                  Bearer interceptor + 401.)
+     |   |-- local/shared_pref_service.dart
+     |   `-- repositories/
+     |       |-- patient_repository.dart                  (listMyPatients →
+     |       |                                             PatientPageResult.items,
+     |       |                                             getPatientById.)
+     |       |-- schedule_repository.dart                 (getSchedulesByMedication,
+     |       |                                             listSchedules, getScheduleById.)
+     |       |-- medication_repository.dart
+     |       `-- smart_box_repository.dart                (boxes, drawers,
+     |                                                      getMedicineBoxSensors TEST7,
+     |                                                      getDrawerSensors TEST8,
+     |                                                      openDrawer/closeDrawer TEST9
+     |                                                      POST endpoints.)
+     |
+     +-- lib/models/
+     |   |-- patient.dart                                  Patient {id, firstName (stored
+     |   |                                                  as firstname getter, lowercase
+     |   |                                                  n), lastName (lastname getter,
+     |   |                                                  lowercase n), gender, bloodType,
+     |   |                                                  fullName}
+     |   |-- medication_model.dart                         MedicationModel
+     |   |-- schedule_model.dart                           ScheduleModel
+     |   |-- medicine_box_model.dart / drawer_model.dart
+     |   |-- drawer_medication_model.dart
+     |   |-- medicine_box_sensor_model.dart                DrawerSensorState +
+     |   |                                                  MedicineBoxSensorStateResponse
+     |   |-- drawer_command_response_model.dart            DrawerCommandResponse
+     |   `-- (auth models etc.)
+     |
+     +-- lib/widgets/
+     |   `-- drawer_sensor_card.dart                       Reusable DrawerSensorCard(
+     |                                                         drawerIndex, temperature?,
+     |                                                         humidity?, fireDetected,
+     |                                                         updatedAt?, drawerId?,
+     |                                                         medicineBoxId?, box?)
+     |                                                         → onTap pushes
+     |                                                         DrawerAssignmentScreen
+     |                                                         for TEST #8 drill-down.
+     |
+     `-- lib/screens/
+         +-- home/home_screen.dart                         HomeShell entry point
+         |                                                    (const HomeScreen({super.key})
+         |                                                    only — NO named params)
+         +-- auth/screen.dart
+         +-- profile/profile_screen.dart                     Settings button navigation →
+         |                                                    push MaterialPageRoute →
+         |                                                    SettingsScreen
+         +-- settings/screen.dart                            SettingsScreen theme switch +
+         |                                                    live Notifications tile.
+         +-- patient/{add_patient,update_patient,patient_details}_screen.dart
+         |                                                    (gender/bloodType normalized)
+         +-- box/
+             |-- box_screen.dart                             MedicineBox dashboard →
+             |                                                   _DrawerSensorSection
+             |                                                   (TEST #7 aggregate).
+             |-- drawer_assignment_screen.dart                  Drawer detail / assignment
+                                                                 screen → 3 sections:
+                                                                 (1) SensorStatus (TEST 8)
+                                                                 (2) DrawerCommandActions
+                                                                     (OPEN / CLOSE TEST9)
+                                                                 (3) Drawer-assignment body
+                                                                 (UNCHANGED).
+
+================================================================================
+SECTION 2  — SCREEN-BY-SCREEN TEST FLOW CHECKLIST
+================================================================================
+Use the following ordered per-screen scripts. Every test should have the same
+result after every new task. Do NOT skip prerequisite checks (they catch
+regressions).
+
+--------------------------------------------------------------------------------
+2.0  GLOBAL PRE-REQUISITES (run ONCE at the start of every test session)
+--------------------------------------------------------------------------------
+  P-1.  File: pubspec.yaml
+        Assertion: assets/logo/ is present in assets list +
+                   flutter_launcher_icons: ^0.14.3 is declared under
+                   dev_dependencies + flutter_launcher_icons: image_path is
+                   set to "assets/logo/icon.png" (NOT hardcoded UUID, NOT a
+                   generated copy).
+
+  P-2.  Source asset integrity (NO MODIFICATION rule check):
+        assets/logo/icon.png size/bytes must be identical to the original
+        (flutter_launcher_icons never writes back to the input file; it only
+        reads).
+
+  P-3.  Backend connectivity sanity:
+        GET  http://192.168.1.170:3000/health  → 200.
+        API_BASE_URL default env fallback = http://192.168.1.170:3000/api.
+
+  P-4.  Login with a valid patient-management user account.
+        401 response anywhere must route through existing global 401 handler
+        and NEVER show a raw token/stack to the user.
+
+================================================================================
+2.1  SCREEN  — HomeShell / HomeScreen (lib/screens/home/home_screen.dart)
+================================================================================
+Flow: app launch → main.dart → MaterialApp(GlobalKey rootNavigatorKey) →
+      AuthenticatedOnly → HomeShell → HomeScreen.
+
+Test H-1 [Cold start]
+  - Kill the app, start fresh.
+  - Expected: NotificationController calls rescheduleAllActive() paginated
+    through all 500 active Schedules with a "keep-set sweep" of pending
+    medication-reminder IDs. No orphan IDs remain scheduled.
+
+Test H-2 [Deep-link warm start (notification tap)]
+  - App is closed → tap a pending medication reminder whose JSON payload has
+    medicationId + scheduleId + patientId.
+  - Expected: GlobalKey rootNavigatorKey.onGenerateRoute →
+    case NotificationController.kRouteMedicationSchedule →
+    AuthenticatedOnly → _NotificationDeepLinkScreen → circular progress →
+    PatientRepository().getPatientById(patientId) → pushReplacement →
+    PatientDetailsScreen(patient) → patient details shown.
+  - Failure mode forbidden:
+    * Never instantiate HomeScreen(initialMedicationId:…) — that constructor
+      does NOT exist and caused a compile error in an earlier build. Fixed
+      by _NotificationDeepLinkScreen.
+
+Test H-3 [Navigate → Profile screen → Settings button (task #3)]
+  - Action: Profile → tap Settings (Scaffold trailing button).
+  - Expected: MaterialPageRoute → SettingsScreen.
+  - Prohibited: no-op onTap; no null-route; no assertion crash.
+
+================================================================================
+2.2  SCREEN  — AddPatient / UpdatePatient (gender + bloodType dropdowns)
+       Path: lib/screens/patient/add_patient_screen.dart
+             lib/screens/patient/update_patient_screen.dart
+================================================================================
+Background: Earlier production bug — DropdownButton assertion
+"exactly one item with value FEMALE" crashed pressing Edit Patient because the
+backend returned "female" (title-case) while Dropdown items contained
+MALE/FEMALE (uppercase canonical). Root cause = mismatch casing + duplicates +
+no invalid→null safety.
+
+Fix applied:
+  * normalizeGender() + normalizeBloodType() uppercase canonical.
+  * Dropdown items = Set.toList() → deduped → only {"MALE","FEMALE"} unique.
+  * Init selectedGender only if value ∈ item set → otherwise null.
+  * Same pattern applied to bloodType dropdown (scan per task rule).
+
+Test G-1 [Add patient]
+  - Tap Add patient. Fill form. Choose Gender = FEMALE. Choose BloodType O+.
+    Submit.
+  - Expected: No DropdownButton Failed Assertion. Patient persisted.
+
+Test G-2 [Edit patient (original crash case)]
+  - Tap a patient whose backend gender row is "female" / "Female".
+  - Click Edit Patient.
+  - Expected: No crash; selectedGender falls back to "FEMALE" canonical or
+    null if invalid (no assertion).
+
+Test G-3 [Invalid backend value]
+  - Simulate DB row gender = "FEMALEALE" (corrupt string). Open UpdatePatient.
+  - Expected: selectedGender = null. Dropdown shows placeholder. No exception.
+
+Test G-4 [Duplicate items defence]
+  - Temporarily force items list to [MALE, FEMALE, MALE]. Dedup → Set →
+    length == 2.
+
+================================================================================
+2.3  SCREEN  — SettingsScreen (theme + notifications)
+       Path: lib/screens/settings/screen.dart
+================================================================================
+State: AnimatedBuilder/ListenableBuilder merges SettingsController +
+NotificationController (live).
+
+Test T-1 [Theme System / Light / Dark — SegmentedButton 3-way]
+  - Action: Tap Dark → background darkens immediately.
+    Navigate out and back → theme persists (SharedPreferences "theme_mode").
+    Tap Light → expected. Tap System → follows OS.
+  - Requirement: NO persistent storage = false; NO flicker; all 3 options
+    round-trip.
+
+Test N-1 [Notifications live permission chip]
+  - Action: Open Settings.
+  - Expected: Tile shows:
+    * Green chip = Permission granted.
+    * Amber chip = Permission not yet determined / partial.
+  - Action: Tap tile → NotificationController.requestPermissions(
+    ifNotPromptedOnly:true) → refreshStatus() → status updates.
+  - SharedPrefs flag notification_permission_prompted_v1 prevents spam-prompt
+    every screen visit.
+
+Test N-2 [Manual prompt bypass]
+  - Permission previously denied by user OS-level.
+  - Expected: No spamming of native permission dialog. Show a helper hint
+    to enable manually.
+
+================================================================================
+2.4  SCREEN  — Medication list / Medication CRUD
+       + Schedule CRUD
+       → NotificationController CRUD hooks verified
+================================================================================
+ScheduleController hooks:
+  onCreate → NotificationController.scheduleAllForSchedule(schedule)
+  onUpdate → rescheduleAllForSchedule (cancel old, then re-schedule new)
+  onDelete → cancelForScheduleId + notifyListeners.
+MedicationController hooks mirror the medication-level scheduleAll / cancel
+broadcast pattern.
+PatientDashboardController hooks: onMedicationUpdated / onMedicationDeleted
+→ propagate reschedule.
+
+Test CUD-1 [Create a schedule with 3 times (HH:mm) on Mon/Wed/Fri]
+  - Verify: NotificationService.scheduleAll → for each HH:mm + each
+    dayOfWeek (1,3,5 ISO) → _nextOccurrenceLocal walks forward wall-clock
+    (TZDateTime) → zonedSchedule (AndroidScheduleMode.exactAllowWhileIdle).
+
+Test CUD-2 [Duplicate prevention (cancel-then-schedule + keep-set sweep)]
+  - Run scheduleAll with same inputs twice in a row.
+  - Verify via flutterLocalNotificationsPlugin.pendingNotificationRequests()
+    → count exactly N requests, NOT 2N.
+
+Test CUD-3 [Update a schedule time 09:00 → 10:00].
+  - Verify after update: 09:00's pending FNV id is CANCELLED (no longer in
+    pending list). 10:00 new FNV id present. No double-fire for same med.
+
+Test CUD-4 [Delete schedule → cancelForScheduleId → pending count decreases
+            by #(times × days).]
+
+Test CUD-5 [ID determinism unit tests]
+  test/notification_service_test.dart = 20 tests.
+  6 assertions about FNV-1a 32-bit masked with 0x7FFFFFFF always produce the
+  SAME 31-bit non-negative int ID for identical {medicationId, scheduleId,
+  HH:mm, timeIndex} inputs. Same input always cancels+reschedules idempotently.
+
+Test CUD-6 [Timezone]
+  Flutter test: final DateTime sched = DateTime(…); final TZDateTime next =
+  NotificationService.instance.nextLocal(…, 9, 0, {1}). Assert the returned
+  wall-clock matches the user's device tzLocation. Fallback offset lookup is
+  used when DateTime.currentTimeZone is NOT a tz database name. NO manual
+  UTC-offset math. NO direct use of plain DateTime in zonedSchedule.
+
+Test CUD-7 [iOS foreground alert no SnackBar fall-back.]
+  DarwinNotificationDetails(presentAlert:true, presentBadge:true,
+  presentSound:true) → plugin presents banner while app open. No fake UI
+  snackbar replacement in lieu of real OS notification.
+
+Test CUD-8 [Platform permission query safety.]
+  iOS uses the deprecated ios.requestPermissions(alert:false, badge:false,
+  sound:false) style safely wrapped. Never crashes if not iOS; never
+  unconditionally calls macOS variants. DarwinNotificationDetails for iOS +
+  macOS (old IOSNotificationDetails removed in plugin 17.x).
+
+================================================================================
+2.5  SCREEN  — BoxScreen (MedicineBox Dashboard)
+       Path: lib/screens/box/box_screen.dart
+       Feature: TEST #7  MedicineBox Sensors Aggregate API integration
+================================================================================
+BoxScreen shows for a selected MedicineBox (id pulled via existing
+currentMedicineBox / activeMedicineBox.id from route args + controller —
+NEVER hardcoded UUID). Sliver order (top → bottom):
+  1.  _BoxHeaderCard — box info.
+  2.  "Drawer Environment & Safety"  → _SensorsSection  (TEST #7).
+  3.  Drawers List — _DrawerTile onTap → DrawerAssignmentScreen(drawer.id, …).
+  4.  Drawer popup-menu switch active box → reloads both.
+  5.  Lifecycle: didPopNext + didChangeAppLifecycleState resumed → refresh.
+
+_SensorsSection (BoxScreen) states → mutual exclusivity rules:
+  State-A Loading:
+    → CircularProgressIndicator at center of sensor section container.
+    → Refresh TextButton disabled. No fake readings (no 0 °C / 0 % placeholders).
+  State-B Error (401/404/network/5xx):
+    → Red tinted card. Error icon + human message + Inline Retry OutlinedButton.
+    → 401 = session expired message.
+    → 404 = "Medicine box unavailable"  (never "not found" / "not owned").
+    → Other = generic "Unable to load…" / existing friendly() pattern.
+    → Retry button disabled during retry request.
+  State-C Empty drawers []:
+    → "No drawers configured." Icons.sensors_off_rounded. Not a crash. Not a
+      hidden card. Not 0-size blank section.
+  State-D Data (drawers.length ≥ 1):
+    → For EACH DrawerSensorState in sorted drawers (drawerIndex ASC per
+      backend guarantee + client-side fallback sort):
+      * Widget = DrawerSensorCard(
+          drawerIndex: d.drawerIndex,    // NOT index+1 — per task requirement.
+          temperature: d.temperature,
+          humidity: d.humidity,
+          fireDetected: d.fireDetected,
+          updatedAt: d.updatedAt,
+          drawerId: d.drawerId,         // enables tap nav to TEST8.
+          medicineBoxId: d.medicineBoxId ?? activeBox.id,
+          box: activeBox,
+        )
+      * Between cards SizedBox AppSpacing.sm separator.
+
+DrawerSensorCard rendering rules (applied BOTH in BoxScreen aggregate TEST 7
+AND DrawerAssignmentScreen TEST 8 — the same exact widget so 100% consistent
+visual identity across screens):
+  R-A.  Temperature reading:
+        temp == null → label "No reading yet".
+        else → "${temp.toStringAsFixed(1)} °C".
+        Exception: temp ≥ 40 → accent AppColors.warning on value tile.
+  R-B.  Humidity reading:
+        humidity == null → "No reading yet".
+        else → "${humidity.toStringAsFixed(1)} %".
+  R-C.  Fire status (fireDetected bool — non-null, default false).
+        FALSE → green pill "Normal".
+        TRUE  → triple fire-alert visual:
+                 (1) Card tint background + red 1.5px border + shadow.
+                 (2) Top-right badge → solid red pill, fire icon + bold white
+                     uppercase "FIRE DETECTED".
+                 (3) Inline banner below header: red-tinted banner + fire
+                     department icon + bold "Fire detected in this drawer.
+                     Please check your medicine box immediately."
+                 (4) Numeric #N badge (top-left) replaced with fire icon.
+  R-D.  Last update:
+        updatedAt == null → "No reading yet".
+        else → formatted "2026-10-05 09:21".
+        NEVER "01/01/1970". NEVER epoch default for null.
+
+Refresh behavior (TEST 7 NO polling):
+  - Manual triggers ONLY (no periodic timer. No WebSocket):
+    1. Section header "Refresh" TextButton.icon.
+    2. Global "Drawers section refresh" → Future.wait(loadDrawers, loadSensors).
+    3. initState _bootstrap → loadSensors background.
+    4. Popup-menu box switch → _ensureSensors() once per new box.
+    5. didChangeAppLifecycleState.resumed + didPopNext → bg refresh both.
+    6. Post ScanBoxScreen → both reload.
+    7. Error card inline Retry → calls same _refreshSensors(box.id).
+  - Loading-disabled on UI while a fetch is in-flight.
+
+Navigation drill-down from TEST 7 → TEST 8:
+  - InkWell on DrawerSensorCard when enabled && drawerId.isNotEmpty &&
+    medicineBoxId.isNotEmpty.
+  - Ripple Material borderRadius: br16.
+  - Push → MaterialPageRoute → DrawerAssignmentScreen(
+      drawerId: drawer.drawerId,
+      drawerNumber: drawer.drawerIndex,
+      drawerStatus: DrawerStatus.loaded,
+      medicineBoxId: <resolved id>,
+      box: box,
+    )
+  - Right chevron shown when navigable.
+
+BoxScreen — TEST 7 Acceptance scenarios (task gate A-H):
+  Scenario A  Normal data — drawerIndex=1 temp=24.6 humidity=58.2 fire=false
+               timestamp.
+               Expected: UI "24.6 °C" / "58.2 %" / "Normal" / formatted ts.
+  Scenario B  No reading — null temp null humidity fire=false null updatedAt.
+               Expected: "No reading yet"×4, card still rendered, no crash.
+  Scenario C  Fire detected fire=true.  Expected: triple fire alert UI.
+  Scenario D  4 drawers.  Expected: 4 DrawerSensorCard, drawerIndex 1..4
+               map correctly using d.drawerIndex NOT loopVar + 1. Sorted ASC.
+  Scenario E  drawers = [].  Expected: "No drawers configured." card.
+  Scenario F  Backend returns 401.  Expected: session expired message +
+               existing auth handler.
+  Scenario G  Backend returns 404.  Expected: "Medicine box unavailable" —
+               NO ownership details disclosed.
+  Scenario H  Backend server not reachable.  Expected: stop loading spinner,
+               show error card with human message + Retry button enabled.
+
+================================================================================
+2.6  SCREEN  — DrawerAssignmentScreen (existing drawer detail screen)
+       Path: lib/screens/box/drawer_assignment_screen.dart
+       Features:
+         - TEST #8  Single Drawer Sensor State (GET /api/drawers/:id/sensors)
+         - TEST #9  Drawer OPEN / CLOSE command (POST /api/drawers/:id/open
+                                                       /api/drawers/:id/close)
+================================================================================
+Sliver order in DrawerAssignmentScreen (unchanged section for assignment body
+— UI inserted ONLY between sliver error banner and the existing drawer body):
+  1.  CustomSliverAppBar ("Drawer N").
+  2.  SliverToBoxAdapter → error banner (_error field, drawer-level loading error
+      for assignment screen init — UNCHANGED existing logic).
+  3.  SliverToBoxAdapter → _DrawerSensorSection  (TEST #8).
+  4.  SliverToBoxAdapter → _DrawerCommandActions  (TEST #9).
+  5.  SliverPadding  →  Drawer body (medication assignment) - UNTOUCHED.
+
+--------------------------------------------------------------------------------
+2.6.1  _DrawerSensorSection  (TEST #8)
+--------------------------------------------------------------------------------
+State inputs fed from SmartBoxController ChangeNotifier + AnimatedBuilder:
+  - drawerId          = widget.drawerId (from route).
+  - drawerNumber      = widget.drawerNumber.
+  - controller        = SmartBoxController.
+  - sensorError       = _sensorError state field set by catch.
+  - loadedOnce        = _hasLoadedSensors.
+
+Per-drawer loading controller flag: controller.isLoadingDrawerSensors(did).
+Cached getter:          controller.sensorStateForDrawer(did).
+
+Mutually-exclusive 4 states:
+  State-A isLoading && state == null && !loadedOnce → CircularProgress.
+  State-B err != null && err.trim().isNotEmpty →
+          Container(error.withOpacity(.10)) + error icon + human error msg +
+          OutlinedButton Retry (disabled if isLoading).
+  State-C state == null && !loadedOnce → mini spinner.
+  State-D data: Reusable DrawerSensorCard — same card used in BoxScreen.
+                * Effective drawer index: state != null && state.drawerIndex>0
+                  ? state.drawerIndex (from single-drawer endpoint response)
+                  : widget.drawerNumber (navigation context fallback).
+                * This way drawer identification from nav context + existing
+                  Drawer model identity preserved (task rule §13).
+
+Refresh paths (no polling):
+  1.  Header row Refresh TextButton.icon → _refreshDrawerSensors().
+  2.  initState post-frame callback → background: true refresh (non blocking).
+  3.  Error card Retry OutlinedButton → foreground: refresh with loading.
+
+Error mappings 401/404/network for TEST #8 (repo → service → controller →
+sensorError banner):
+  401       → Your session has expired. Please log in again.
+  404 / not found / no longer own / another user
+            → Drawer unavailable.
+  Exception → Unable to load drawer sensor data. (catch-all friendly).
+
+Data flow consistency with TEST 7 aggregate:
+  When SmartBoxController.loadDrawerSensorState() returns a DrawerSensorState
+  with medicineBoxId populated, the controller UPSERTS that drawer into
+  _sensorStateByBox[medicineBoxId].drawers list (replaces the same drawerId
+  already inside the aggregate response cache OR appends + resort ASC).
+  Result: refreshing single drawer from TEST 8 detail ALSO updates the TEST 7
+  BoxScreen aggregate cache. They share state and never show stale values.
+  This also guarantees invalidation: Drawer1→Back→Drawer2 never shows
+  Drawer1 sensor readings on Drawer 2 page because `_sensorStateByDrawer`
+  is a per-drawer map keyed by drawerId String UUID.
+
+TEST #8 acceptance scenarios (task rules A-H + D/E):
+   A   Normal data (24.6°C / 58.2% / false / 2026-10-05T09:21Z)
+       → renders "24.6 °C / 58.2 % / Normal / 2026-10-05 09:21".
+   B   All-4 null → renders "No reading yet" 4x + Normal chip.
+   C   fireDetected true → triple fire-alert visual.
+   D   Navigation test:
+        1. Open BoxScreen. Tap Drawer 1 sensor card.
+           → Push MaterialPageRoute to DrawerAssignmentScreen with
+             drawerId = drawer.drawerId (actual UUID from TEST 7 response).
+        2. Open drawer 2 sensor card → Drawer 2, did = drawer2 UUID.
+        → Per-drawer caches do NOT leak stale drawer 1 values onto drawer2.
+        (guaranteed by Set + Map keyed on drawerId).
+   E   Drawer navigation idempotent: switch rapidly between drawer1 and
+       drawer2; no duplicate in-flight requests causing flicker.
+   F   401 → session expired card.
+   G   Non-owner GET /api/drawers/:id/sensors → 404 maps to "Drawer
+       unavailable." — never "not found" or "another user owns this drawer".
+   H   Invalid UUID: GET /api/drawers/<non-existent-id>/sensors → 404 maps
+       to the same "Drawer unavailable." message.
+   I   Backend stop → catch block stops loading; error banner + Retry.
+
+--------------------------------------------------------------------------------
+2.6.2  _DrawerCommandActions  (TEST #9 — Open / Close drawer)
+--------------------------------------------------------------------------------
+New UI component inserted as a SliverToBoxAdapter ABOVE drawer body.
+Structure inside _DrawerCommandActions Container:
+  1.  Header Row:
+      - 40×40 box: lock_open_rounded icon (theme primary tinted background).
+      - Label: "Drawer Controls"  sub: "Send open or lock commands to
+        Drawer N remotely."
+  2.  Action Row (2 buttons side by side, equal Expanded width):
+      * _OpenDrawerButton   — OutlinedButton.icon.
+                             — primary color scheme, border primary.
+                             — Label: OPEN / UNLOCK  (bold 800).
+                             — Icon when idle: Icons.lock_open_rounded 18px.
+                             - Icon while loading: CircularProgressIndicator
+                               (16×16 stroke width 2).
+                             — onPressed = loading ? null : _openDrawer().
+      * _CloseDrawerButton  — OutlinedButton.icon.
+                             — foregroundColor AppColors.error.
+                             — Border error.withOpacity(.55).
+                             — backgroundColor error.withOpacity(.04).
+                             — Label CLOSE / LOCK (bold).
+                             — Icon idle: Icons.lock_rounded.
+                             — loading: spinner replaces icon.
+                             — onPressed = loading ? null : _closeDrawer().
+
+  3.  3 mutually-exclusive BANNER slots shown UNDER the buttons:
+      (a)  ERROR → if _commandError != null →
+           Container(error.withOpacity(.10)) + Icons.error_outline_rounded 18
+           + Text(error) → AppColors.error 600 weight font.
+      (b)  FEEDBACK → if feedbackType ∈ {OPENING, OPEN_COMMAND_SENT,
+           CLOSING, CLOSE_COMMAND_SENT}:
+           → Container tinted based on result:
+             in progress (OPENING / CLOSING) → theme.primary.withOpacity(.08).
+             success   (X_COMMAND_SENT)   → success.withOpacity(.10).
+           → Leading icon:
+              in-progress → 16×16 spinner, valueColor: primary.
+              success     → check_circle_outline success.
+              default     → info outline.
+           → Inner column:
+                line1:   "Opening drawer…" / "Open command sent" /
+                         "Closing drawer…" / "Close command sent".
+                line2:   "Command ID: <id>  •  Status: PENDING".
+                line3:   "Created: <yyyy-MM-dd HH:mm>" (HTTP 200 create time).
+      (c)  IDLE NOTE → no command has been sent yet.
+           Body text:
+           "Note: HTTP 200 means the command was created. The physical
+            action happens once the medicine box device picks it up."
+           (Implements the key requirement 7: do NOT confuse PENDING with
+           physical draw-open / draw-closed).
+
+_confirmCloseDrawer dialog (required before any `POST /close` is issued):
+  - Builder = AlertDialog(title "Close Drawer?").
+  - Content = 2 paragraphs:
+      "The drawer will receive a lock command."
+      "\n\nNote: A successful response means the command was created. The "
+      "physical lock happens once the medicine box device picks it up."
+  - shape = RoundedRectangleBorder(AppRadius.br16).
+  - Actions: [TextButton("Cancel") → pop(false),
+              TextButton("Close Drawer", style red fg) → pop(true)].
+  - _closeDrawer() Future: showDialog; confirmed != true → return silently
+    (no state mutation). Confirmed == true → proceed to command.
+
+TEST #9 — Flow scripts  (task #9 A → I):
+   A-1 [Open flow end-to-end]
+        1. Open DrawerAssignmentScreen (valid drawerId, valid auth,
+           backend online, drawer associated with a device).
+        2. Tap "[ 🔓 OPEN / UNLOCK ]".
+        3. EXACT sequence observed on the UI:
+           a) Both buttons immediately disabled (shared loading flag via
+              isSendingDrawerCommand did).
+           b) Button label "Opening…" replaces "OPEN / UNLOCK".
+           c) Icon inside button: spinner replaces lock_open icon.
+           d) Banner under buttons → BLUE tint "Opening drawer…" + spinner.
+           e) HTTP 200 → GREEN tint success container "Open command sent".
+           f) Line: "Command ID: <UUID from response> • Status: PENDING".
+           g) Line: "Created: <formatted createdAt from response.body>".
+           h) Scaffold SnackBar (floating, success bg, white bold):
+              "Open command sent. Waiting for medicine box device."
+        4. NEGATIVE checks (MUST NEVER occur):
+           * Drawer quantity decremented in drawer model.   → FORBIDDEN.
+           * Medication session created anywhere.          → FORBIDDEN.
+           * drawer.isOpen mutated client-side.            → FORBIDDEN.
+           * "Drawer opened" or "Drawer is now open" labels → FORBIDDEN.
+           * polling or GET /api/devices/:id/commands      → FORBIDDEN.
+           * Calling POST /api/drawer-commands/:id/result  → FORBIDDEN.
+           * second simultaneous tap succeeds              → blocked at 3 levels.
+
+   A-2 [Close flow end-to-end]
+        1. Tap "[ 🔒 CLOSE / LOCK ]".
+        2. Confirmation dialog appears. Tap outside → NO request sent.
+           Click Cancel → dialog dismisses, NO POST.
+        3. Click red-foreground "Close Drawer" → proceed.
+        4. Buttons disabled → "Closing…" label → BLUE in-progress banner.
+        5. HTTP 200 → GREEN banner "Close command sent" + CommandId + PENDING
+           + createdAt + SnackBar (fg=textPrimary):
+           "Close command sent. Waiting for medicine box device."
+
+   B   [Cancel close → NO network]
+        1. Open dialog. Click Cancel.
+           ASSERT: no POST request is made. Controller lastDrawerCommand(did)
+           remains unchanged from prior value.
+
+   C   [Double tap race defence]
+        1. Rapidly tap OPEN twice.
+           ASSERT: only 1 HTTP POST. 3 layers of guard:
+           Layer 1 Controller.set guard: _sendingDrawerCommands.contains(did)
+             → throws "A drawer command is already in progress."
+           Layer 2 UI disable: onPressed = loading ? null : callback.
+           Layer 3 Button text flip to "Opening…" / spinner → visual
+           feedback that button is disabled.
+
+   D   Tap OPEN while a CLOSE is still in flight → same set guard: one at a
+       time per drawerId.
+
+   E   [401 Unauthorized] API /api/drawers/:did/open returns 401.
+       Expected → container ERROR with "Your session has expired. Please log
+       in again."; existing global 401 logout flow triggers; navigation to
+       login screen; no token printed anywhere.
+
+   F   [404 Non-owner]  Backend returns 404 (or 400 w/ "no longer own").
+       Expected → ERROR banner RED: "This drawer is no longer available."
+       NOT "404 not found", NOT "you don't own this drawer".
+
+   G   [Invalid UUID] POST with a non-existent drawerId → same 404 message
+       "This drawer is no longer available.".
+
+   H   [Drawer + device not associated → backend returns 400 "drawer is not
+       associated with any device"]
+       Expected: message → "This drawer is not connected to a medicine box
+       device." (maps 400 status + body substrings).
+
+   I   [Backend stopped → SocketException / Failed host lookup]
+       Banner: "Unable to connect to the medicine box server.\nPlease check
+       your connection and try again."
+       → Loading stops; Retry button (in the sensor section) works. The
+       command state card allows next tap attempt (no infinite spinner).
+
+   J   [Timeout  → "The request timed out. Please try again." banner.]
+
+   K   [Any other uncategorised throw]
+       → "Unable to send the drawer command. Please try again." catch-all.
+
+   L   [PENDING status vs physical execution separation]
+       Inspect 4 locations for the correct wording after a successful POST:
+       (1) Success banner title uses "sent", NOT "done / completed / opened /
+           closed / locked / unlocked".
+       (2) Success banner shows Status: PENDING (verbatim from backend).
+       (3) Snackbar copies the PENDING nature: "Waiting for medicine box
+           device."
+       (4) Confirmation dialog warning explicitly warns that HTTP 200 does
+           NOT equal physical lock executed yet.
+       (5) Quantity model + MedicationSession model — ZERO writes anywhere
+           in the 3 layers for a command.
+
+================================================================================
+2.7  ANDROID BUILD SYSTEM GATE — NOTIFICATION DESUGARING / MULTIDEX
+     files:  android/app/build.gradle.kts  (android block)
+             android/app/src/main/AndroidManifest.xml (7 permissions)
+================================================================================
+Purpose: flutter_local_notifications:^17.2.4 declares in its AAR metadata
+that coreLibraryDesugaringEnabled=true is required (plugin uses java.time.*
+APIs internally). This project has minSdk=23 (API < 26), so desugaring is
+mandatory. Without it → build task `:app:checkDebugAarMetadata` ABORTS with:
+   "Dependency ':flutter_local_notifications' requires core library
+    desugaring to be enabled for :app."
+
+Verified verbatim build success (earlier task): `flutter build apk --debug`
+→ produced build/app/outputs/flutter-apk/app-debug.apk after 172s.
+
+Required Gradle assertions (never break these):
+  BuildG-1.  defaultConfig.minSdk              = 23.
+  BuildG-2.  defaultConfig.multiDexEnabled     = true.
+  BuildG-3.  compileOptions {
+               sourceCompatibility   = JavaVersion.VERSION_11
+               targetCompatibility   = JavaVersion.VERSION_11
+               isCoreLibraryDesugaringEnabled = true      ← CRITICAL.
+             }
+  BuildG-4.  dependencies:
+               coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.3")
+               implementation("androidx.multidex:multidex:2.0.1")
+
+AndroidManifest 7 permissions (manifest L4-L10) — all declared under
+`<manifest>` tag (NOT inside <application>):
+  1. POST_NOTIFICATIONS
+  2. SCHEDULE_EXACT_ALARM
+  3. USE_EXACT_ALARM
+  4. USE_FULL_SCREEN_INTENT
+  5. RECEIVE_BOOT_COMPLETED
+  6. WAKE_LOCK
+  7. VIBRATE
+Android notification channel id = "medication_reminders" (created in
+NotificationService). Scheduling mode = exactAllowWhileIdle.
+
+================================================================================
+2.8  TESTS (unit/integration)
+================================================================================
+Test files:
+  1.  test/medicine_box_contract_test.dart  —  41 tests  (contract).
+  2.  test/notification_service_test.dart   —  20 tests  (new).
+
+Run command for manual trigger:
+  flutter test test/medicine_box_contract_test.dart test/notification_service_test.dart
+
+Expected result (61 total):  All tests passed. (0 skipped, 0 failures, exit 0.)
+
+NotificationServiceTest (20) explicitly validates:
+  T1.  FNV-1a 32-bit → 31-bit non-negative deterministic int IDs.
+  T2.  Identical inputs produce identical IDs (cancel-then-schedule is safe).
+  T3.  cancel-then-schedule + keep-set sweep leaves exactly N requests.
+  T4.  Schedule update removes old time IDs, adds new IDs.
+  T5.  Delete cancels all per-scheduleId / per-medicationId.
+  T6.  Eligibility: only ScheduleStatus.active && isActive=true → scheduled.
+  T7.  timesPerDay fallback when times List is missing.
+  T8.  Body builder concatenates patient firstname/lastname + med name + dose.
+  T9.  Permission query crash safety: not iOS skips silently; iOS
+       deprecated ios.requestPermissions wrapped with try.
+  T10. Permission prompt spam guard: SharedPrefs flag prompted_v1 set once.
+
+================================================================================
+SECTION 3  — SCREEN NAVIGATION MAP (high level flow)
+================================================================================
+                              ┌──────────────────────────┐
+                              │  Login Screen (auth)     │← 401 GLOBAL REDIRECT
+                              └──────────────┬───────────┘
+                                             │ valid login
+                                             ▼
+                              ┌──────────────────────────┐
+                              │  HomeShell / HomeScreen   │ ← Cold start triggers
+                              │  (dashboard router)       │   NotificationController
+                              └──────┬──────────────┬─────┘   rescheduleAllActive()
+                                     │              │
+                                     ▼              ▼
+                    ┌────────────────────────┐   ┌──────────────────────┐
+                    │  Patient list           │   │  ProfileScreen       │
+                    │  PatientDetailsScreen   │   │  (Settings Btn)      │───┐
+                    │  (+ med/schedules)      │   └──────────────────────┘   │
+                    └┬────────────────────────┘                              │
+                     │                                                       ▼
+                     │ tap notification (closed)                   SettingsScreen │
+                     ▼                                              (theme + live
+  ┌─────────────────────────────────────────────────────────┐    notifications)
+  │ Notification DeepLink _NotificationDeepLinkScreen       │
+  │ ─ resolve patientId via PatientRepository.getPatientById│
+  └┬────────────────────────────────────────────────────────┘
+   │ pushReplacement
+   ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │ PatientDetailsScreen (meds, schedules, assigned box)    │
+  └┬───────────┬───────────────────────────┬─────────────────┘
+   │           │                           │
+   ▼           ▼                           ▼
+ EditPatient  AddMedication              SmartBox
+ (gender dedupe +                       MedicineBox
+  bloodType normalize)                    dashboard box_screen.dart
+                                            │
+                                            │ Pick box → active Box
+                                            ▼
+                              ┌──────────────────────────────────┐
+                              │  BoxScreen (MedicineBox)         │─── TEST #7 ──┐
+                              │  ├ _BoxHeaderCard                 │                │
+                              │  ├ _SensorsSection (aggregate)    │◄───────────────┘
+                              │  │    (refresh + errors + empty)  │
+                              │  └ Drawers list _DrawerTile       │
+                              └┬──────────────────────────────────┘
+                               │ tap a single Drawer
+                               │ ─ OR tap DrawerSensorCard (drilldown, InkWell ripple
+                               │         + chevron right when navigable)
+                               ▼
+                   ┌──────────────────────────────────────────────────┐
+                   │  DrawerAssignmentScreen (existing drawer detail) │
+                   │  ├─ Error banner            (UNCHANGED)           │
+                   │  ├─ _DrawerSensorSection   (TEST #8)              │
+                   │  │     header, refresh, error, empty, data card   │
+                   │  ├─ _DrawerCommandActions  (TEST #9)              │
+                   │  │     2 side-by-side O/C buttons                 │
+                   │  │     3 banners (error / in-progress-sent / idle│
+                   │  │     AlertDialog only before CLOSE confirmation │
+                   │  └─ Drawer assignment body  (UNCHANGED)           │
+                   └──────────────────────────────────────────────────┘
+
+================================================================================
+SECTION 4  — API CONTRACT (Flutter → Backend)
+================================================================================
+Base URL: const String.fromEnvironment("API_BASE_URL",
+                                      defaultValue:
+                                      "http://192.168.1.170:3000/api")
+Client : single instance ApiClient(http.Client + AuthStorage Bearer JWT
+         injection + 20s timeout + UTF-8 JSON decode + existing 401 handler).
+         Do NOT duplicate with a second client for new endpoints.
+
+Endpoint                                        Flutter Layer call site
+────────────────────────────────────────────────────────────────────────
+GET /api/patients?page=1&limit=500
+  → listMyPatients(limit:) → PatientPageResult.items
+  Used by NotificationController to rebuild reminders
+  and PatientDetailsScreen.
+
+GET /api/medicine-boxes/{mbid}/sensors
+  → SmartBoxRepository.getMedicineBoxSensors(mbid)
+  → SmartBoxService.loadSensorState(mbid)
+  → SmartBoxController.loadSensorStateForBox(mbid)
+  → BoxScreen _SensorsSection rebuild via AnimatedBuilder
+  (TEST #7 aggregate endpoint).
+
+GET /api/drawers/{did}/sensors
+  → SmartBoxRepository.getDrawerSensors(did)
+  → SmartBoxService.loadDrawerSensorState(did)
+  → SmartBoxController.loadDrawerSensorState(did)
+    * side effect: upserts drawer into _sensorStateByBox[medicineBoxId].
+  → DrawerAssignmentScreen _DrawerSensorSection rebuild
+  (TEST #8 single drawer endpoint).
+
+POST /api/drawers/{did}/open
+  body: {}  |  {"reason":"Manual open by user"}
+  → SmartBoxRepository.openDrawer(did, reason:)
+     (via private _sendDrawerCommand helper)
+  → SmartBoxService.openDrawer
+  → SmartBoxController.openDrawer
+    * guards double submit via Set<String> _sendingDrawerCommands
+    * stores Map _lastCommandByDrawer and global lastCommand* fields.
+  → DrawerAssignmentScreen _openDrawer sets feedback banner + SnackBar GREEN.
+  (TEST #9 Open).
+
+POST /api/drawers/{did}/close
+  body: {}  |  {"reason":"Manual close by user"}
+  → SmartBoxRepository.closeDrawer(did, reason:)
+  → SmartBoxService.closeDrawer
+  → SmartBoxController.closeDrawer
+  → UI side: _confirmCloseDrawer dialog required, confirmed == true check
+    before POST.
+  → Feedback banner GREEN + SnackBar(textPrimary bg) after success.
+  (TEST #9 Close).
+
+Explicit FORBIDDEN endpoints (NEVER called by Flutter app):
+  * GET  /api/devices/{deviceId}/commands    (Pi polling only).
+  * POST /api/drawer-commands/{cmdId}/result (Pi writes result only).
+  Reason: backend architecture = Edge (Raspberry Pi) executes command; the
+  Flutter mobile app is a command CREATOR only. The mobile app must NOT try
+  to spoof results.
+
+401 / 404 / 400 / timeout / socket error mapping table lives at
+§ 2.5 State-B, § 2.6.1 errors, § 2.6.2 command errors.
+All error cards use user-friendly strings. Dio stack traces / Prisma / SQL
+strings NEVER reach the UI.
+
+================================================================================
+SECTION 5  — QUICK REGRESSION SMOKE-TEST (run after every code change)
+================================================================================
+Step  Command                                             Expected exit
+───── ────────────────────────────────────────────────── ─────────────────
+1     flutter pub get                                     exit 0, "Got
+                                                          dependencies!"
+2     dart analyze --format=machine lib/                  0 ERROR / 0
+                                                          COMPILE_TIME_ERROR
+                                                          rows.
+3     flutter test                                        61/61 passed,
+                                                          exit 0.
+4     flutter build apk --debug                           Produces
+                                                          app-debug.apk,
+                                                          passes
+                                                          checkDebugAarMetadata
+                                                          (this gate will
+                                                          fail instantly if
+                                                          desugaring is ever
+                                                          removed — never
+                                                          delete it.)
+5     Manual UI spot checks
+      5a. Launch app → allow notifications → set schedule in future.
+          Minimize app (not killed). 10 s before time → confirm alarm
+          rings OS notification banner.
+      5b. Open BoxScreen. Verify 3 sensors states (load / err / ok) render
+          correctly.
+      5c. Tap a DrawerSensorCard → push DrawerAssignmentScreen.
+          Tap OPEN → button spinner + banner → "Open command sent" +
+          PENDING appears in the banner.
+          Tap CLOSE → AlertDialog appears; confirm → "Close command sent".
+      5d. Switch drawer from 1 → 2 → back; verify sensor data does NOT
+          leak drawer1 into drawer2 screen.
+
+================================================================================
+SECTION 6  — TASK STATUS SUMMARY
+================================================================================
+  Task #1  Patient Gender / BloodType Dropdown crash fix   ✓ VERIFIED
+  Task #2  Settings Theme Switch  System/Light/Dark        ✓ VERIFIED
+  Task #3  Profile → Settings button nav                   ✓ VERIFIED
+  Task #4  Medication OS reminders (20 tests)              ✓ VERIFIED
+           flutter_local_notifications + timezone,
+           deterministic FNV IDs, cancel-then-schedule
+           + stale sweep keep-set, boot-completed perm.
+  Task #5  Android desugaring / multidex / build           ✓ VERIFIED
+           (fix :app:checkDebugAarMetadata AAR fail)
+  Task #7  MedicineBox Sensors Aggregate API  GET mbx id  ✓ VERIFIED
+           BoxScreen _SensorsSection
+  Task #8  Single Drawer Sensor GET /drawers/:id/sensors  ✓ VERIFIED
+           DrawerAssignmentScreen _DrawerSensorSection
+           + BoxScreen DrawerSensorCard drill-down navigation
+  Task #9  Drawer OPEN / CLOSE commands POST endpoints    ✓ VERIFIED
+           400/401/404/network/timeout/device-missing maps
+           PENDING != physical. Confirmation on CLOSE.
+           3 layers double-tap guard. Quantity / session not touched.
+  App Icon assets/logo/icon.png launcher integration       ✓ VERIFIED
+           All platforms (android mipmap, iOS asset catalog,
+           web manifest icons, mac AppIcon, windows ico,
+           linux icons) regenerated. Transparency preserved
+           (remove_alpha_ios:false).
+
+================================================================================
+END OF REPORT.
+================================================================================
