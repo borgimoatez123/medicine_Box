@@ -1,0 +1,11 @@
+fastapi>=0.115.0,<1.0
+uvicorn[standard]>=0.30.0,<1.0
+pydantic>=2.9.0,<3.0
+pydantic-settings>=2.5.0,<3.0
+python-multipart>=0.0.9,<1.0
+
+# Core ML / image processing (CPU execution provider by default)
+insightface>=0.7.3
+onnxruntime>=1.19.0
+numpy>=1.26.0,<2.1
+opencv-python-headless>=4.9.0,<5.0
