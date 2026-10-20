@@ -1,0 +1,586 @@
+================================================================================
+MEDICATION EVENT 409 ANALYSIS
+Smart Medicine Box — Raspberry Pi → Node.js Backend
+Generated: 2026-10-12
+Scope: Read-only diagnostic. No source code, DB records, or config modified.
+================================================================================
+
+1. EXECUTIVE SUMMARY
+------------------------------------------------------------------------------
+The recurring HTTP 409 Conflict on POST /api/devices/medication-events is
+caused by a medication-assignment mismatch:
+
+  The schedule references medication "paranormal" (id 94c14b77-...),
+  but the configured drawer (c77a90f8-...) holds a DIFFERENT medication
+  (id 4bf7ace9-...). In fact, the schedule's medication is NOT assigned to
+  ANY drawer in the system.
+
+The backend correctly rejects the event at
+  src/application/use-cases/device/ProcessPatientMedicationEvent.ts, line 168
+with:
+  ConflictError('Schedule medication does not match drawer medication')
+
+This is a DATA problem, not a code bug. The Raspberry Pi is told by the
+schedule API that drawerId is null (because no drawer is assigned to that
+medication), but it falls back to a hardcoded configured drawer ID that holds
+a different medication. The backend's integrity check catches this and returns
+409, which is the correct defensive behavior.
+
+The failure is NOT a duplicate event (duplicates return HTTP 200 with
+duplicate:true), NOT an insufficient-quantity issue (qty is 20, dosage is 1),
+and NOT a drawer/box ownership issue (drawer belongs to the box).
+
+--------------------------------------------------------------------------------
+
+2. OBSERVED FAILURE AND TIMELINE
+------------------------------------------------------------------------------
+Timeline from Raspberry Pi logs (2026-10-12, Africa/Tunis):
+
+  03:41:06  Motor command published: time=03:41
+            schedule=6247993e-e75a-4c92-abdb-d5f483227a48
+            command=f8e67d50-caa5-46b6-a29b-23204b1e052d
+  03:41:09  Action ACK accepted (ESP32 #2 servo sequence completed)
+  03:41:11  Medication event POST failed: HTTP 409 Conflict
+            url: http://192.168.1.170:3000/api/devices/medication-events
+            ~472-byte response body
+
+Other endpoints in the same session return HTTP 200:
+  - POST /api/devices/heartbeat             -> 200
+  - GET  /api/devices/DEV-BOX-zQL2QCn/schedule -> 200
+  - POST /api/devices/sensor-readings       -> 200
+
+The motor physically executed successfully (servo ACK OK), but the backend
+rejected the medication-event persistence request, so no MedicationSession
+was recorded and the DrawerMedication.quantity was NOT decremented.
+
+--------------------------------------------------------------------------------
+
+3. END-TO-END REQUEST FLOW
+------------------------------------------------------------------------------
+Raspberry Pi
+  |  POST /api/devices/medication-events
+  |  (multipart/JSON body: deviceId, patientId, scheduleId, drawerId,
+  |   status, quantityTaken)
+  v
+Express route:
+  src/presentation/routes/devices.routes.ts:18
+  devicesRouter.post('/medication-events', DevicesController.recordMedicationEvent)
+  v
+Controller:
+  src/presentation/controllers/DevicesController.ts:273-314
+  recordMedicationEvent()
+    - Parses req.body through medicationEventSchema (Zod)
+    - Resolves deviceId (from trusted req.deviceId or body)
+    - Instantiates 7 repositories + PrismaDeviceMedicationEventProcessor
+    - Calls ProcessPatientMedicationEvent.execute(payload)
+  v
+Use case:
+  src/application/use-cases/device/ProcessPatientMedicationEvent.ts:130-258
+  execute() performs sequential validation:
+    L138  box = medicineBoxRepository.findByDeviceId(deviceId)         -> NotFound
+    L141  patient = patientRepository.findById(patientId)              -> NotFound
+    L144  patient.userId === box.userId                                -> Forbidden 403
+    L148  schedule = scheduleRepository.findById(scheduleId)           -> NotFound 404
+    L151  medication = medicationRepository.findById(schedule.medicationId)
+    L152  medication.patientId === patientId                           -> Forbidden 403
+    L156  drawer = drawerRepository.findById(drawerId)                 -> NotFound 404
+    L159  drawer.medicineBoxId === box.id                              -> Conflict 409 (*)
+    L163  drawerMedication = drawerMedicationRepository.findByDrawerId(drawerId)
+    L164  drawerMedication exists                                      -> Conflict 409 (*)
+    L167  drawerMedication.medicationId === medication.id              -> Conflict 409 (*) <-- HIT
+    L171  expectedDosage = parseLeadingInteger(schedule.dosage)        -> BadRequest 400
+    L176-189 status/quantityTaken business rules                       -> BadRequest/Conflict 409
+    L212  currentQuantity >= quantityTaken                             -> Conflict 409
+    L216  deviceMedicationEventProcessor.processEvent({...})           -> creates MedicationSession
+  v
+Processor:
+  src/infrastructure/services/PrismaDeviceMedicationEventProcessor.ts:47-172
+  processEvent()
+    - Prisma $transaction
+    - For TAKEN: re-checks drawerMedication.quantity >= quantityTaken (Conflict 409)
+    - medicationSession.create(...) with occurrenceDate/occurrenceTime
+      - On P2002 unique violation (MedicationSession_schedule_occurrence_unique):
+        sets duplicate=true, fetches existing row, returns 200 (NOT 409)
+    - For TAKEN & !duplicate: drawerMedication.updateMany with qty guard
+    - Returns { duplicate, session, remainingQuantity, refillRequired, missingQuantity }
+  v
+Error middleware:
+  src/presentation/middlewares/errorMiddleware.ts:33-57
+  ConflictError extends AppError with statusCode=409
+  Response envelope: { status: "fail", statusCode: 409, message: "..." }
+
+--------------------------------------------------------------------------------
+
+4. ACTUAL REQUEST PAYLOAD (RECONSTRUCTED FROM EVIDENCE)
+------------------------------------------------------------------------------
+The Raspberry Pi's backend_orchestrator.py is NOT present in this workspace
+(it lives on the Pi at ~/face-recognition-pi/). The payload is reconstructed
+from:
+  - The schedule API response fields observed in prior logs
+  - The configured drawer ID stated in the task
+  - The medicationEventSchema validation requirements
+  - The DB state verified read-only on 2026-10-12
+
+Expected JSON body sent by the Pi:
+{
+  "deviceId": "DEV-BOX-zQL2QCn",
+  "patientId": "c5a4277e-0950-4bd6-aa2d-02e883965347",
+  "scheduleId": "6247993e-e75a-4c92-abdb-d5f483227a48",
+  "drawerId": "c77a90f8-a493-4985-89fc-12b058083558",   <- configured, NOT from schedule
+  "status": "TAKEN",
+  "quantityTaken": 1
+}
+
+NOTE: The schedule API response for this schedule returns drawerId: null
+(see GetDeviceSchedule.ts L104: drawerId: dm ? dm.drawerId : null), because
+no DrawerMedication row links the schedule's medication to any drawer.
+The Pi ignores the null and uses its hardcoded configured drawerId.
+
+--------------------------------------------------------------------------------
+
+5. BACKEND ROUTE, CONTROLLER, AND SERVICE ANALYSIS
+------------------------------------------------------------------------------
+5.1 Validation Schema
+  File: src/presentation/validators/devices.validator.ts:40-65
+  medicationEventSchema requires (all strict, no extra fields):
+    - deviceId:      non-empty string
+    - patientId:     non-empty string
+    - scheduleId:    non-empty string
+    - drawerId:      non-empty string
+    - status:        enum ['TAKEN', 'MISSED']
+    - quantityTaken: integer
+  Super-refine rules:
+    - TAKEN requires quantityTaken > 0
+    - MISSED requires quantityTaken === 0
+
+5.2 Controller
+  File: src/presentation/controllers/DevicesController.ts:273-314
+  recordMedicationEvent()
+    - No JWT auth on this route (device identity from body; security limitation
+      noted in controller header comment)
+    - Body parsed via medicationEventSchema; on failure -> BadRequestError 400
+    - Trusted deviceId override via resolveRequestingDeviceId() (future middleware)
+    - Passes validated payload to ProcessPatientMedicationEvent
+
+5.3 Use Case (where 409 is produced)
+  File: src/application/use-cases/device/ProcessPatientMedicationEvent.ts
+  ConflictError (409) throw sites:
+    L160: 'Drawer does not belong to this device\'s medicine box'
+          condition: drawer.medicineBoxId !== box.id
+    L165: 'Drawer has no medication assigned'
+          condition: drawerMedication === null
+    L168: 'Schedule medication does not match drawer medication'
+          condition: drawerMedication.medicationId !== medication.id   <-- TRIGGERED
+    L185: 'Quantity taken does not match scheduled dosage'
+          condition: expectedDosage !== quantityTaken (for TAKEN)
+    L213: 'Insufficient medication quantity'
+          condition: currentQuantity < quantityTaken (for TAKEN)
+
+5.4 Processor duplicate handling
+  File: src/infrastructure/services/PrismaDeviceMedicationEventProcessor.ts:89-121
+  On Prisma P2002 (unique constraint MedicationSession_schedule_occurrence_unique):
+    - duplicate = true
+    - fetches existing MedicationSession
+    - returns duplicate:true to use case
+  Use case (L232-246) returns HTTP 200 with { duplicate: true, message: '...' }
+  => Duplicate events do NOT produce 409. They produce 200.
+
+--------------------------------------------------------------------------------
+
+6. DATABASE MODELS AND CONSTRAINTS
+------------------------------------------------------------------------------
+6.1 MedicationSession (Prisma schema.prisma L208-235)
+  Fields: id, scheduleId, patientId, medicationId, drawerId, scheduledAt,
+          startedAt, completedAt, quantityBefore, quantityAfter, result,
+          occurrenceDate, occurrenceTime
+  Constraints:
+    - @@unique([scheduleId, occurrenceDate, occurrenceTime],
+        map: "MedicationSession_schedule_occurrence_unique")
+      This is the idempotency/duplicate guard. A second event for the same
+      (schedule, Africa/Tunis date, resolved time slot) is caught here and
+      returned as duplicate (HTTP 200), NOT 409.
+    - @@index([drawerId]), @@index([scheduleId, scheduledAt]),
+      @@index([drawerId, completedAt])
+  result enum: PATIENT_TAKEN | MISSED (from MedicationSessionResult)
+
+6.2 DrawerMedication (join of Drawer x Medication)
+  Fields: id, drawerId, medicationId, quantity, missingQuantity, assignedAt,
+          isActive, createdAt, updatedAt
+  The medication assigned to a drawer is determined by THIS row's medicationId.
+  There is no patientId column on DrawerMedication (patient is derived through
+  the Medication.patientId relation).
+
+6.3 Schedule
+  Fields: id, medicationId, dosage, timesPerDay, times (string[]), startDate,
+          endDate, daysOfWeek (int[]), status, notes, refillReminder, createdAt,
+          updatedAt, isActive
+  The schedule points to a Medication via medicationId.
+
+6.4 Drawer
+  Fields: id, medicineBoxId, drawerNumber, status, createdAt, updatedAt
+  status enum: EMPTY | LOADED | LOCKED | DISPENSING | ERROR
+
+6.5 MedicineBox
+  Fields: id, deviceId, deviceToken, name, status, userId, numberOfDrawers,
+          drawerCapacity, createdAt, updatedAt, deviceStatus, lastSeenAt
+
+--------------------------------------------------------------------------------
+
+7. EXACT ROOT CAUSE OF HTTP 409
+------------------------------------------------------------------------------
+CONFIRMED ROOT CAUSE: Medication mismatch between Schedule and Drawer.
+
+The 409 is thrown at:
+  src/application/use-cases/device/ProcessPatientMedicationEvent.ts:168
+  throw new ConflictError('Schedule medication does not match drawer medication');
+
+Triggering condition:
+  drawerMedication.medicationId !== medication.id
+
+Verified against the live Supabase database (read-only SELECT, 2026-10-12):
+
+  Schedule (id 6247993e-e75a-4c92-abdb-d5f483227a48):
+    medicationId = 94c14b77-809f-4b0c-9648-9e1d82a91a81
+    dosage       = "1"
+    times        = ["03:41", "12:00", "20:25"]
+    daysOfWeek   = [1,2,3,4,5,6,7]
+    status       = ACTIVE, isActive = true
+
+  Medication (id 94c14b77-809f-4b0c-9648-9e1d82a91a81):
+    name     = "paranormal"
+    dosage   = "10"
+    patientId = c5a4277e-0950-4bd6-aa2d-02e883965347  (matches patient)
+
+  Drawer (configured, id c77a90f8-a493-4985-89fc-12b058083558):
+    medicineBoxId = a63e11fa-2dd3-434a-9fea-1d0e14d1583c  (matches box)
+    drawerNumber  = 1
+    status        = LOADED
+
+  DrawerMedication (for drawer c77a90f8-...):
+    medicationId = 4bf7ace9-a807-4b09-95fa-1e3619766e60   <- DIFFERENT medication
+    quantity     = 20
+    isActive     = true
+
+  DrawerMedication rows for schedule.medicationId (94c14b77-...):
+    []  (EMPTY - the schedule's medication is NOT assigned to any drawer)
+
+Therefore:
+  drawerMedication.medicationId (4bf7ace9-...) != medication.id (94c14b77-...)
+  => ConflictError 409 "Schedule medication does not match drawer medication"
+
+This is a DATA INTEGRITY issue: the medication the schedule says to dispense
+("paranormal") is not loaded into any drawer. The drawer that the Pi is
+configured to use holds a completely different medication.
+
+Why the schedule API returns drawerId: null:
+  GetDeviceSchedule.ts:92-95 sets dm = null when the drawerMedication's
+  drawer.medicineBoxId !== box.id, or when there is no drawerMedication
+  linked to the schedule's medication. Since "paranormal" has no
+  DrawerMedication row, the JOIN returns null, and the response includes
+  drawerId: null. The Pi then substitutes its hardcoded configured drawerId,
+  which holds the wrong medication.
+
+Why it is NOT any of the other 409 paths:
+  - L159 (drawer not in box): drawer.medicineBoxId === box.id  -> PASS
+  - L164 (no medication in drawer): drawerMedication EXISTS    -> PASS
+  - L185 (dosage mismatch): schedule.dosage="1", quantityTaken=1 -> PASS
+  - L213 (insufficient qty): drawerMedication.quantity=20 >= 1 -> PASS
+  - Duplicate: duplicate path returns 200, not 409            -> N/A
+
+--------------------------------------------------------------------------------
+
+8. EVIDENCE AND RELEVANT FILE LOCATIONS
+------------------------------------------------------------------------------
+Route:        src/presentation/routes/devices.routes.ts:18
+Validator:    src/presentation/validators/devices.validator.ts:40-65
+Controller:   src/presentation/controllers/DevicesController.ts:273-314
+Use case:     src/application/use-cases/device/ProcessPatientMedicationEvent.ts
+                L138 find box, L141 find patient, L144 patient/box user match,
+                L148 find schedule, L151-154 medication + patient match,
+                L156 find drawer, L159-160 drawer/box match [409],
+                L163-165 drawerMedication exists [409],
+                L167-168 medication match [409] <-- ROOT CAUSE,
+                L171 dosage parse, L180-189 qty rules, L212 qty check [409],
+                L216 processor call
+Processor:    src/infrastructure/services/PrismaDeviceMedicationEventProcessor.ts
+                L82 insufficient qty [409], L89-121 duplicate -> 200,
+                L124-130 updateMany qty guard [409]
+Schedule API: src/application/use-cases/device/GetDeviceSchedule.ts:92-105
+                drawerId set to null when no matching drawerMedication
+Error mw:     src/presentation/middlewares/errorMiddleware.ts:33-57
+AppError:     src/shared/errors/AppError.ts:38-40 (ConflictError -> 409)
+Prisma:       prisma/schema.prisma L208-235 (MedicationSession + unique index)
+
+DB evidence (read-only SELECT, no writes):
+  MedicineBox:  a63e11fa-2dd3-434a-9fea-1d0e14d1583c
+                userId=a72b930d-b62a-4fcc-98ba-7aee6d20b402, drawerCapacity=20
+  Patient:      c5a4277e-0950-4bd6-aa2d-02e883965347
+                userId=a72b930d-b62a-4fcc-98ba-7aee6d20b402 (matches box user)
+  Schedule:     6247993e-e75a-4c92-abdb-d5f483227a48
+                medicationId=94c14b77-809f-4b0c-9648-9e1d82a91a81, dosage="1"
+  Medication:   94c14b77-809f-4b0c-9648-9e1d82a91a81
+                name="paranormal", patientId matches patient
+  Drawer:       c77a90f8-a493-4985-89fc-12b058083558
+                medicineBoxId matches box, drawerNumber=1, status=LOADED
+  DrawerMed:    a31f00ee-9ae6-4e1f-9f9e-4d731d428aab
+                medicationId=4bf7ace9-a807-4b09-95fa-1e3619766e60
+                (NOT the schedule's medication), quantity=20
+  DrawerMed for schedule.medicationId 94c14b77-...: [] (none)
+
+--------------------------------------------------------------------------------
+
+9. WHY THE OTHER API ENDPOINTS WORK
+------------------------------------------------------------------------------
+- heartbeat: Only updates MedicineBox.deviceStatus and lastSeenAt. No
+  medication or drawer relationship checks. Always succeeds for a valid deviceId.
+
+- schedule (GET): Returns schedule rows. For schedules whose medication is not
+  assigned to a drawer, it returns drawerId: null (graceful). It does not
+  enforce that a medication must be in a drawer, so it returns 200.
+
+- sensor-readings: Upserts DrawerSensorState by drawerNumber within a box.
+  No medication relationship involved. Succeeds as long as the drawer belongs
+  to the device.
+
+- medication-events (POST): Enforces the full integrity chain:
+  box -> patient -> schedule -> medication -> drawer -> drawerMedication.
+  This is the only endpoint that requires the medication in the schedule to
+  match the medication physically loaded in the drawer. When that invariant
+  fails, it correctly returns 409.
+
+--------------------------------------------------------------------------------
+
+10. RECOMMENDED FIX
+------------------------------------------------------------------------------
+The fix is primarily a DATA fix, with a secondary Pi-side contract improvement.
+
+PRIMARY (data) — Assign the schedule's medication to the configured drawer:
+  Option A (correct the drawer assignment):
+    Update the DrawerMedication row for drawer c77a90f8-... to point to
+    medicationId 94c14b77-... ("paranormal") — ONLY if the physical drawer
+    actually contains "paranormal" pills. This must be verified physically
+    before changing the DB, because the servo will dispense whatever is
+    physically in the drawer.
+
+  Option B (correct the schedule):
+    If the physical drawer actually contains medication 4bf7ace9-..., then
+    update the Schedule.medicationId to 4bf7ace9-... so the schedule matches
+    the physical contents.
+
+  Option C (re-assign):
+    Delete the current DrawerMedication (4bf7ace9-...) and create a new
+    DrawerMedication linking drawer c77a90f8-... to medication 94c14b77-...
+    with the correct quantity. Use the existing POST /api/drawer-medications
+    endpoint or the ADMIN drawer assignment flow.
+
+  The correct option depends on which medication is PHYSICALLY in drawer 1.
+  The DB must reflect physical reality; otherwise the wrong pills dispense.
+
+SECONDARY (Pi contract) — Stop using a hardcoded configured drawerId:
+  The Pi should derive drawerId from the schedule API response, not from a
+  hardcoded value. If the schedule API returns drawerId: null, the Pi should
+  NOT attempt to dispense — it should surface a configuration error to the
+  user (e.g., "No drawer assigned to this medication") and skip the motor
+  command. This prevents the motor from running when the backend will reject
+  the event.
+
+  Specifically, in backend_orchestrator.py's _record_medication_event and
+  schedule-parsing code:
+    - Use schedule_entry['drawerId'] from the GET /schedule response.
+    - If drawerId is null, log a configuration error and do not run the motor.
+    - Do not fall back to a hardcoded configured drawer ID.
+
+TERTIARY (backend, optional but recommended) — Improve the 409 message:
+  The current message "Schedule medication does not match drawer medication"
+  is accurate but does not tell the operator WHICH medication is in the
+  drawer vs. which the schedule expects. For debuggability, the backend could
+  log (server-side only, not in the response) the expected medicationId and
+  the drawer's actual medicationId. The response message itself is fine as-is
+  for security (no internal IDs leaked to the client).
+
+--------------------------------------------------------------------------------
+
+11. IMPLEMENTATION PLAN
+------------------------------------------------------------------------------
+Step 1 — Physical verification (DO FIRST, before any DB change):
+  Inspect the physical contents of drawer 1 on device DEV-BOX-zQL2QCn.
+  Determine whether it contains "paranormal" (94c14b77-...) or the other
+  medication (4bf7ace9-...).
+
+Step 2 — Data correction (based on Step 1):
+  If drawer 1 physically contains "paranormal":
+    Update DrawerMedication.medicationId from 4bf7ace9-... to 94c14b77-...
+    (and set quantity to the actual count in the drawer).
+  If drawer 1 physically contains the other medication:
+    Update Schedule.medicationId from 94c14b77-... to 4bf7ace9-...
+    (verify the other medication belongs to the same patient).
+  If drawer 1 is empty or contains something else:
+    Load the correct medication, then create/update the DrawerMedication row.
+
+  Use the existing REST endpoints (POST /api/drawer-medications,
+  PATCH /api/drawer-medications/:id, PATCH /api/schedules/:id) rather than
+  raw SQL, so business rules (ownership, cascade) are enforced.
+
+Step 3 — Pi code change (backend_orchestrator.py):
+  - Parse drawerId from each schedule entry returned by GET /schedule.
+  - If drawerId is null for a schedule entry:
+      * Do not publish a motor command for that entry.
+      * Log a clear configuration warning.
+      * Optionally display on OLED: "No drawer for [medicationName]".
+  - Remove the hardcoded configured drawer ID fallback (or make it only a
+    default that is overridden by the schedule-provided drawerId).
+
+Step 4 — Backend optional improvement:
+  In ProcessPatientMedicationEvent.ts around L167-168, add a server-side log
+  (not in HTTP response) containing:
+    scheduleId, expectedMedicationId, drawerMedicationId, actualMedicationId
+  to speed up future diagnosis. Do not change the HTTP response.
+
+Step 5 — Verification:
+  - Re-fetch GET /schedule and confirm drawerId is non-null for the schedule.
+  - Trigger a test dispense (or use the existing test flow) and confirm
+    POST /medication-events returns 200 with remainingQuantity decremented.
+  - Confirm DrawerMedication.quantity decreased by quantityTaken.
+  - Confirm a MedicationSession row was created.
+
+--------------------------------------------------------------------------------
+
+12. SAFE VERIFICATION AND REGRESSION TESTS
+------------------------------------------------------------------------------
+12.1 Read-only verification (no production writes):
+  - GET /api/devices/DEV-BOX-zQL2QCn/schedule
+    Confirm the schedule for 6247993e-... now returns a non-null drawerId
+    matching the drawer that holds the correct medication.
+  - GET /api/drawer-medications?drawerId=c77a90f8-...
+    Confirm medicationId matches the schedule's medicationId.
+
+12.2 Functional test (integration, requires physical access or test fixture):
+  - POST /api/devices/medication-events with the corrected payload:
+    {
+      "deviceId": "DEV-BOX-zQL2QCn",
+      "patientId": "c5a4277e-0950-4bd6-aa2d-02e883965347",
+      "scheduleId": "6247993e-e75a-4c92-abdb-d5f483227a48",
+      "drawerId": "<drawer-holding-paranormal>",
+      "status": "TAKEN",
+      "quantityTaken": 1
+    }
+    Expect HTTP 200 with:
+      { status: "success", data: { status: "TAKEN", remainingQuantity: 19,
+        refillRequired: false, ... } }
+
+12.3 Duplicate idempotency test:
+  - POST the same event again (same schedule, same Africa/Tunis date, same
+    time slot).
+    Expect HTTP 200 with data.duplicate === true and
+    message "Medication event already processed".
+    Confirm quantity is NOT decremented twice.
+
+12.4 Invalid relationship test (regression — must still 409):
+  - POST with a drawerId that holds a different medication than the schedule.
+    Expect HTTP 409 "Schedule medication does not match drawer medication".
+    This confirms the integrity guard still works after the data fix.
+
+12.5 Insufficient quantity test:
+  - Set drawer quantity to 0, POST status=TAKEN quantityTaken=1.
+    Expect HTTP 409 "Insufficient medication quantity".
+
+12.6 Drawer/box mismatch test:
+  - POST with a drawerId belonging to a different medicine box.
+    Expect HTTP 409 "Drawer does not belong to this device's medicine box".
+
+12.7 Pi-side regression:
+  - With the Pi code change, simulate a schedule entry with drawerId: null.
+    Confirm no motor command is published and a config warning is logged.
+
+--------------------------------------------------------------------------------
+
+13. RISKS AND RECOVERY OF THE FAILED MEDICATION EVENT
+------------------------------------------------------------------------------
+13.1 What happened to the failed event:
+  - The motor ran (servo ACK OK) — pills were physically dispensed.
+  - The backend rejected the POST with 409.
+  - NO MedicationSession row was created (the 409 is thrown at L168, before
+    the processor at L216).
+  - DrawerMedication.quantity was NOT decremented (still 20).
+  - Result: the physical pill count is now 19 (one dispensed) but the DB
+    still says 20. Inventory drift of 1 pill.
+
+13.2 Risks:
+  - Inventory drift: DB quantity (20) vs. physical quantity (19). If not
+    reconciled, future "insufficient quantity" checks will be wrong and
+    refill alerts will fire late.
+  - No audit trail: The dispense is not recorded in MedicationSession, so
+    there is no compliance record that the patient received the dose.
+  - Repeated failures: Until the data is fixed, every dispense attempt for
+    this schedule will 409, causing repeated inventory drift and no session
+    records.
+  - Motor/event desync: The Pi currently logs "Manual reconciliation may be
+    required" but does not retry or queue. Failed events are silently lost
+    from the audit perspective.
+
+13.3 Safe recovery (requires operator action, NOT automatic):
+  a) Fix the data (Step 2 in Section 11) so future events succeed.
+  b) Reconcile inventory: Manually decrement DrawerMedication.quantity for
+     the corrected drawer-medication by the number of pills that were
+     physically dispensed but not recorded (1 pill for this event, plus any
+     additional failed attempts). Use PATCH /api/drawer-medications/:id
+     with the corrected quantity.
+  c) Create a backdated MedicationSession manually (or via an admin endpoint
+     if one exists) to record the missed dose(s) for compliance. Set
+     result=PATIENT_TAKEN, occurrenceDate/occurrenceTime to the actual
+     Africa/Tunis date/time of the failed event.
+  d) Implement the Pi-side fix (Section 11 Step 3) to prevent the motor from
+     running when no drawer is assigned, eliminating future inventory drift.
+
+13.4 Do NOT:
+  - Automatically retry the failed event (the medication mismatch means it
+    would 409 again).
+  - Delete or modify the failed MotorCommand/DeviceCommand records.
+  - Assume the physical drawer contents match the DB without verifying.
+
+--------------------------------------------------------------------------------
+
+14. UNRESOLVED QUESTIONS AND MISSING EVIDENCE
+------------------------------------------------------------------------------
+1. Exact Pi payload: The Raspberry Pi's backend_orchestrator.py was not
+   available in this workspace (it lives on the Pi). The payload in Section 4
+   is reconstructed from the schema, schedule response, and DB state. The
+   exact field names and values should be confirmed by inspecting the Pi's
+   outgoing request logs or the backend's access logs.
+
+2. Physical drawer contents: It is unknown whether drawer 1 physically
+   contains "paranormal" (94c14b77-...) or the other medication
+   (4bf7ace9-...). This determines whether the data fix is Option A or B
+   in Section 10. Physical inspection is required before any DB change.
+
+3. Identity of medication 4bf7ace9-...: The name and patient of the
+   medication currently in the drawer were not fetched (the probe script
+   focused on the schedule's medication). This should be checked to ensure
+   both medications belong to the same patient before any re-assignment.
+
+4. Number of failed attempts: Only one failed event is described in the
+   logs (03:41:11). It is unknown whether the Pi retried or whether the
+   12:00 and 20:25 slots also failed. Querying MedicationSession for this
+   schedule on 2026-10-12 would confirm whether any sessions were recorded
+   (expected: none, since all would 409).
+
+5. Whether the Pi has a retry/backoff mechanism for the medication-event
+   POST: The log says "Manual reconciliation may be required" which suggests
+   no automatic retry. Confirming this requires reading backend_orchestrator.py.
+
+6. Whether medication 4bf7ace9-... has its own schedule: If it does, that
+   schedule would also fail (since the drawer holds 4bf7ace9 but if a
+   schedule for 4bf7ace9 exists and the Pi uses the same configured drawer,
+   it would succeed for that schedule but fail for the "paranormal" schedule).
+   This should be checked to understand the full scope of the issue.
+
+7. The exact 472-byte response body: Not captured in the logs. Based on the
+   error middleware, it should be:
+   {"status":"fail","statusCode":409,
+    "message":"Schedule medication does not match drawer medication"}
+   This should be confirmed by checking the backend's HTTP access logs or
+   by re-running the request against a test fixture.
+
+================================================================================
+END OF REPORT
+================================================================================

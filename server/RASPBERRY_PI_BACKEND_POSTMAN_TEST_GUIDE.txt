@@ -1,0 +1,2331 @@
+============================================================
+RASPBERRY PI ↔ BACKEND
+COMPLETE POSTMAN MANUAL TEST GUIDE
+==================================
+
+Project:
+Smart Medicine Box
+
+Backend:
+Node.js + Express + TypeScript + Prisma + PostgreSQL/Supabase
+
+Purpose:
+Manual testing of ALL Raspberry Pi ↔ Backend APIs currently
+implemented. Each endpoint below documents the REAL request /
+response / auth / payload / expected status / database effect
+as implemented in the current codebase. Nothing is invented.
+
+Base URL:
+http://localhost:3000
+
+Postman Environment Variables (set these in Postman
+Environment → Globals, or as collection variables):
+
+  baseUrl      = http://localhost:3000
+  adminEmail   = superborgi@med.com
+  adminPass    = SecurePassword123!
+  token        = REPLACE_WITH_JWT_FROM_LOGIN
+  deviceId     = REPLACE_WITH_REAL_DEVICE_ID
+  medicineBoxId= REPLACE_WITH_REAL_MEDICINE_BOX_ID
+  patientId    = REPLACE_WITH_REAL_PATIENT_ID
+  drawerId     = REPLACE_WITH_REAL_DRAWER_ID
+  drawerId2    = REPLACE_WITH_2ND_DRAWER_ID    (optional: multi-drawer)
+  scheduleId   = REPLACE_WITH_REAL_SCHEDULE_ID
+  medicationId = REPLACE_WITH_REAL_MEDICATION_ID
+
+URL references:
+  {{baseUrl}}/api/auth/login                     (bootstrap token)
+  {{baseUrl}}/api/devices/*                      (Raspberry Pi side)
+  {{baseUrl}}/api/medicine-boxes/:id/sensors     (Flutter mobile side)
+  {{baseUrl}}/api/drawers/:id/sensors            (Flutter mobile side)
+
+Prerequisites before any Postman call:
+
+* Backend is running.
+  Run:  npm run dev    (or npm start from dist)
+  Verify:  GET {{baseUrl}}/health   -> {"status":"ok"}
+
+* Database is reachable (no prisma:P1001 / P1008 errors in console).
+  If you see "Can't reach database server at pooler.supabase.com:5432"
+  fix network/pooler creds first — no device write test will pass until
+  DB is reachable.
+
+* Required database records exist (see section 2 below for how to
+  obtain real IDs). At minimum you must have:
+  - 1 User (role USER or ADMIN) for mobile sensor GETs.
+  - 1 MedicineBox row owned by that user, with a NON-NULL deviceId.
+  - 1 Patient row linked (patient.userId === MedicineBox.userId,
+    OR in the current architecture: all rows are owned by their
+    user.id — use the same user who owns the MedicineBox).
+  - 2x Drawer rows (drawer.medicineBoxId = your MedicineBox.id).
+  - 1 Medication row.
+  - 1 DrawerMedication row (drawerId, medicationId, quantity>0,
+    isActive=true).
+  - 1 Schedule row (patientId, medicationId, drawerId non-null,
+    timesPerDay=[...], daysOfWeek=[1..7], isActive=true,
+    startDate <= today, endDate >= today or endDate=null).
+  - Optional (for face tests): Patient.avatarUrl not null pointing
+    into Supabase patient-avatars public bucket.
+
+* Postman is installed.
+* (Optional but recommended) Postman collection created so all
+  requests below can be replayed without re-typing JSON.
+
+IMPORTANT:
+All IDs used below MUST correspond to REAL records in the current
+database. Obtain them from Supabase SQL editor / Prisma Studio
+(npx prisma studio), NOT from the example strings in this file.
+The placeholder strings such as REPLACE_WITH_REAL_DEVICE_ID are
+exactly that — placeholders. Do not send requests with the literal
+strings "REPLACE_WITH_*"; you will get 404 Not Found.
+
+============================================================
+============================================================
+1. AUTHENTICATION MECHANISMS (IMPLEMENTED AS-IS, NO INVENTION)
+============================================================
+
+The project uses TWO SEPARATE authentication patterns, depending
+on which endpoint you call. Both are documented verbatim from the
+actual middleware / controllers.
+
+----------------------------------------------------------------
+Pattern A — User / Mobile (Flutter) endpoints
+----------------------------------------------------------------
+Used by:
+  GET /api/medicine-boxes/:id/sensors
+  GET /api/drawers/:id/sensors
+  GET /api/devices/medication-events        (JWT or deviceId query)
+  Every other /api/medicine-boxes, /api/drawers, /api/patients,
+  /api/users, /api/medications, /api/schedules, /api/drawer-medications
+  route.
+
+Implementation files:
+  src/presentation/middlewares/authMiddleware.ts
+    -> requireAuth() wrapped on medicineBoxRouter (medicineBox.routes.ts L7)
+    -> requireAuth() wrapped on drawerRouter (drawer.routes.ts L6)
+    -> requireAuth() wrapped on every other user router.
+
+Header required:
+  Authorization: Bearer {{token}}
+
+If missing:  HTTP 401  status='fail'  message='No token provided'
+If bad/expired token: HTTP 401 status='fail' message varies by JWT verify error.
+
+How to get {{token}} (ONE TIME BOOTSTRAP):
+
+  POSTMAN REQUEST #0 — LOGIN (BOOTSTRAP TOKEN, REQUIRED FIRST)
+  ------------------------------------------------------------
+  METHOD:      POST
+  FULL URL:    {{baseUrl}}/api/auth/login
+  AUTH:        None (this is the token provider)
+  HEADERS:
+    Content-Type: application/json
+  BODY (raw JSON):
+    {
+      "email": "{{adminEmail}}",
+      "password": "{{adminPass}}"
+    }
+  Where the values come from:
+    prisma/seed-admin.ts + .env SYSTEM_ADMIN_EMAIL / SYSTEM_ADMIN_PASSWORD
+    (real default seeded values:
+      SYSTEM_ADMIN_EMAIL    = superborgi@med.com
+      SYSTEM_ADMIN_PASSWORD = SecurePassword123!)
+    Run npx prisma:seed if you have never seeded the ADMIN user.
+
+  EXPECTED HTTP STATUS: 200 OK
+  EXPECTED RESPONSE (envelope from okPublic helper):
+    {
+      "status": "success",
+      "statusCode": 200,
+      "data": {
+        "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...<LONG JWT>",
+        "user": {
+          "id": "uuid-uuid-uuid-uuid",
+          "email": "superborgi@med.com",
+          "role": "ADMIN",
+          "firstName": null,
+          "lastName": null,
+          "phone": null
+        }
+      }
+    }
+
+  POSTMAN ACTION after successful login:
+    Copy data.accessToken into Postman environment variable {{token}}.
+    All Pattern A calls below reuse it automatically via the header.
+
+  CURL EQUIVALENT:
+    curl -X POST "http://localhost:3000/api/auth/login" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "email": "superborgi@med.com",
+        "password": "SecurePassword123!"
+      }'
+
+  NEGATIVE TEST (wrong password):
+    BODY: {"email":"superborgi@med.com","password":"WrongPassword!"}
+    EXPECTED: 401 status='fail', message='Invalid credentials'
+              NO data.accessToken field in response.
+
+----------------------------------------------------------------
+Pattern B — Raspberry Pi / Device endpoints (NO HEADER AUTH)
+----------------------------------------------------------------
+Used by:
+  POST /api/devices/heartbeat
+  GET  /api/devices/patients/:patientId/face-reference
+  POST /api/devices/face-verification
+  GET  /api/devices/:deviceId/schedule
+  POST /api/devices/medication-events
+  GET  /api/devices/medication-events        (deviceId query, no JWT)
+  POST /api/devices/sensor-readings
+
+REAL AUTH IMPLEMENTATION (verbatim from DevicesController.ts L1–L93):
+
+  SECURITY LIMITATION (intentional, current codebase):
+    Device authentication via X-Device-Id / X-Device-Token HTTP headers
+    is NOT enforced on any /api/devices/* route. There is no middleware
+    that validates those headers.
+
+  INSTEAD the device identity is resolved inside every controller method
+  via resolveRequestingDeviceId(req), which returns the FIRST non-empty
+  value from THIS PRIORITY ORDER:
+
+    1. req.deviceId   (field populated by a FUTURE trusted-device
+                       middleware that is NOT YET WRITTEN — today this
+                       is always empty / undefined, so it is skipped)
+    2. req.query.deviceId    (URL query string: ?deviceId=...)
+    3. req.body.deviceId     (JSON POST body field "deviceId")
+
+  For the heartbeat / face-verification / medication-events /
+  sensor-readings POST calls:
+    ALWAYS include "deviceId": "{{deviceId}}" in your JSON BODY.
+    (source 3 above — this is the only source that works for POST
+    requests with a JSON payload).
+
+  For the GET calls (face-reference and schedule):
+    GET /api/devices/patients/:patientId/face-reference
+      ?deviceId={{deviceId}}   (because face-reference route does not
+                                 contain deviceId in its URL params.
+                                 Must pass as query string per source 2).
+    GET /api/devices/:deviceId/schedule
+      deviceId is in the URL params. resolveRequestingDeviceId also
+      reads it as a fallback from validated schema param, so it works
+      without query string. Adding ?deviceId= is optional but harmless.
+
+  NO X-Device-Id HEADER IS REQUIRED OR HONORED TODAY.
+  Do not waste time adding it in Postman.
+  The ONLY current "auth" for device endpoints is the literal
+  "deviceId" field in JSON body or query string.
+
+  This limitation is TEMPORARY and explicitly called out in the
+  controller file comment block (DevicesController.ts L1–L6).
+
+============================================================
+============================================================
+2. HOW TO OBTAIN REAL VALUES FOR Postman VARIABLES (NO INVENTION)
+============================================================
+No seed data exists for MedicineBox, Patient, Drawer, Schedule,
+Medication, DrawerMedication rows today (only the ADMIN user is
+seeded via prisma/seed-admin.ts). You must obtain real UUID values
+using the process below, or create rows via the normal ADMIN CRUD
+HTTP endpoints exposed by the backend (out of scope for the device
+guide but listed for reference):
+
+Step 1: Open Prisma Studio (recommended)
+  Run:  cd c:\Users\borgi\Desktop\app\server ; npx prisma studio
+  A browser tab opens at http://localhost:5555
+
+Step 2: Copy values from these tables (REAL Prisma model names):
+  User                        -> copy User.id.
+  MedicineBox                 -> copy MedicineBox.id  (medicineBoxId var).
+                                 copy MedicineBox.deviceId (deviceId var;
+                                 this must be a non-null unique string;
+                                 if null, UPDATE the row and set one
+                                 e.g. PI-DEV-001).
+  Patient                     -> copy Patient.id (patientId var). Make
+                                 sure Patient.userId equals the User.id
+                                 above (ownership).
+  Drawer                      -> copy at least 2 Drawer.id values into
+                                 drawerId and drawerId2. Confirm
+                                 Drawer.medicineBoxId = medicineBoxId.
+  Medication                  -> copy Medication.id (medicationId).
+  DrawerMedication            -> ensure one row exists per Drawer:
+                                 drawerId, medicationId, quantity>0,
+                                 isActive=true.
+  Schedule                    -> copy Schedule.id (scheduleId var).
+                                 Schedule.patientId = patientId.
+                                 Schedule.medicationId = medicationId.
+                                 Schedule.drawerId must be non-null and
+                                 equal drawerId.
+                                 Schedule.isActive = true.
+                                 Schedule.startDate <= today.
+                                 Schedule.endDate  >= today OR null.
+                                 Schedule.timesPerDay is a non-empty
+                                 Postgres TEXT[] array of HH:MM entries
+                                 matching regex ^\d{2}:\d{2}$.
+                                 Schedule.daysOfWeek is a non-empty
+                                 array of integers 1..7.
+
+ALTERNATIVE if Prisma Studio is unavailable:
+  Run Supabase SQL Editor:
+    select id, deviceId, userId, status, deviceStatus from "MedicineBox";
+    select id, userId, "avatarUrl" from "Patient";
+    select id, "medicineBoxId", status from "Drawer";
+    select id, "patientId", "drawerId", "medicationId", quantity,
+           "isActive", "timesPerDay", "daysOfWeek" from "Schedule"
+     where "isActive" = true;
+
+============================================================
+============================================================
+3. STANDARD RESPONSE ENVELOPE (ALL ENDPOINTS, NON-NEGOTIABLE)
+============================================================
+Every HTTP 2xx / 4xx / 5xx response uses errorMiddleware.ts plus
+okPublic helper (DevicesController.ts L70–L75):
+
+Success (HTTP 2xx):
+  {
+    "status": "success",
+    "statusCode": 200,
+    "data": { <payload documented for each endpoint below> }
+  }
+
+Client error (HTTP 4xx):
+  {
+    "status": "fail",
+    "statusCode": <400|401|403|404|409>,
+    "message": "<human readable reason, exact string from AppError class>"
+  }
+  In development builds only: a stack property may also be appended.
+
+Server error (HTTP 5xx):
+  {
+    "status": "error",
+    "statusCode": 500,
+    "message": "Internal server error"
+  }
+
+All test sections below write ONLY the `data` portion of a success
+response (to avoid repeating the envelope each time). Remember the
+full response wraps it.
+
+============================================================
+============================================================
+SECTION A: RASPBERRY PI SIDE ENDPOINTS
+(6 IMPLEMENTED ENDPOINTS)
+============================================================
+
+============================================================
+TEST #1 — DEVICE HEARTBEAT
+============================================================
+Purpose:
+  The Raspberry Pi calls this endpoint every <DEVICE_OFFLINE_THRESHOLD_MS
+  default 5000ms. The backend sets MedicineBox.lastSeenAt = now() and
+  MedicineBox.deviceStatus = ACTIVE. A separate background monitor
+  DeviceOfflineMonitor flips deviceStatus back to OFFLINE if 5s pass
+  without a new heartbeat.
+
+METHOD:      POST
+FULL URL:    {{baseUrl}}/api/devices/heartbeat
+AUTH:        Pattern B — deviceId in JSON BODY ONLY (no JWT).
+             No X-Device-Id header required.
+HEADERS:
+  Content-Type: application/json
+BODY (raw JSON):
+  {
+    "deviceId": "{{deviceId}}"
+  }
+Real validator source: devices.validator.ts L3–L7 heartbeatSchema
+  zod object strict; deviceId string non-empty. No extra keys allowed
+  (strict() will throw BadRequestError on unexpected fields).
+
+POSTMAN STEPS:
+ 1. Open Postman.
+ 2. New request.
+ 3. Method = POST.
+ 4. URL = {{baseUrl}}/api/devices/heartbeat
+ 5. Headers → add Content-Type: application/json.
+ 6. Body → raw → JSON (dropdown).
+ 7. Paste the JSON above.
+ 8. Replace {{deviceId}} with the REAL MedicineBox.deviceId
+    you copied from Prisma Studio in section 2.
+ 9. Click Send.
+10. Compare to the expected response / status below.
+11. Open Prisma Studio → MedicineBox → verify the row's lastSeenAt
+    is "just now", and deviceStatus = ACTIVE.
+
+EXPECTED HTTP STATUS: 200 OK
+EXPECTED RESPONSE (data inside the success envelope):
+  {
+    "deviceId": "{{deviceId}}",
+    "status": "ACTIVE",
+    "lastSeen": "2026-09-29T10:00:00.000Z"
+  }
+Where status comes from MedicineBox.deviceStatus field (enum
+DeviceStatus = ACTIVE | OFFLINE). The "lastSeen" is always a
+fresh ISO-8601 UTC timestamp on every successful call.
+
+DATABASE EFFECT (real Prisma fields):
+  UPDATE "MedicineBox"
+    SET "lastSeenAt"   = now(),
+        "deviceStatus" = 'ACTIVE'
+    WHERE "deviceId" = {{deviceId}};
+  (PrismaMedicineBoxRepository.touchHeartbeat).
+
+VERIFICATION:
+  Prisma Studio MedicineBox row for your deviceId:
+    lastSeenAt timestamp advances every call.
+    deviceStatus stays = ACTIVE between calls.
+
+  Let the device sit >DEVICE_OFFLINE_THRESHOLD_MS (5s default) without
+  any heartbeat call, then re-check deviceStatus. If the backend
+  process is running, DeviceOfflineMonitor will set it back to
+  OFFLINE after the threshold.
+  (This is the actual implemented offline behavior, source:
+   DeviceOfflineMonitor.ts + PrismaMedicineBoxRepository.markStaleDevicesOffline
+   updateMany WHERE lastSeenAt < now() - thresholdMs → deviceStatus OFFLINE).
+
+---
+Positive sub-test (1A) — repeated heartbeat
+  Call the same request 5 times. Every call returns HTTP 200 with an
+  updated lastSeen timestamp. No 409, no idempotency issues. Heartbeat
+  is safe to repeat.
+
+---
+Negative sub-test (1B) — invalid / nonexistent deviceId
+  BODY:  {"deviceId": "NO-SUCH-DEVICE-0000"}
+  EXPECTED HTTP STATUS: 404
+  EXPECTED RESPONSE:
+    {
+      "status": "fail",
+      "statusCode": 404,
+      "message": "MedicineBox not found for this deviceId"
+    }
+  DB EFFECT: none (zero rows updated).
+
+---
+Negative sub-test (1C) — missing deviceId / extra keys
+  BODY 1 (empty JSON):   {}
+  BODY 2 (bad type):     {"deviceId": 12345}
+  BODY 3 (extra key):    {"deviceId":"{{deviceId}}", "foo":"bar"}
+  EXPECTED HTTP STATUS: 400 for ALL THREE.
+  EXPECTED RESPONSE:
+    {
+      "status": "fail",
+      "statusCode": 400,
+      "message": "deviceId is required"
+    }
+  (The message is a static string per formatZodErrors 'heartbeat'
+  branch; it intentionally simplifies any zod heartbeat issue to
+  that text.)
+
+CURL EQUIVALENT for positive test:
+  curl -X POST "http://localhost:3000/api/devices/heartbeat" \
+    -H "Content-Type: application/json" \
+    -d '{"deviceId": "PI-DEV-001"}'
+
+Replace PI-DEV-001 with a real deviceId.
+
+============================================================
+TEST #2 — FACE REFERENCE DOWNLOAD (STEP A of Face Recognition)
+============================================================
+Purpose:
+  The Raspberry Pi requests the patient face reference from the
+  backend. The backend returns a PUBLIC Supabase Storage URL pointing
+  to the latest patient avatar image. The Pi downloads that image and
+  runs its OWN face recognition locally.
+  IMPORTANT (from real implementation):
+    -> THE BACKEND NEVER RUNS FACE RECOGNITION MODEL INFERENCE.
+    -> The backend only serves the reference URL and audits the
+       verification result sent back by the Pi.
+    -> Recognition happens entirely on the Raspberry Pi's CPU/GPU
+       via whatever library ships there (OpenCV / face_recognition /
+       MediaPipe / etc. — the backend code is agnostic).
+
+METHOD:      GET
+FULL URL:
+  {{baseUrl}}/api/devices/patients/{{patientId}}/face-reference?deviceId={{deviceId}}
+AUTH:        Pattern B. deviceId must be in ?query= (required, because
+             the URL schema does NOT contain deviceId; validated by
+             getFaceReferenceSchema devices.validator.ts L9–L14 strict).
+HEADERS:     (no Content-Type; no body for GET).
+             Accept: application/json  (optional but recommended).
+
+POSTMAN STEPS:
+ 1. New GET request.
+ 2. URL as above; replace {{patientId}} and {{deviceId}}.
+ 3. Click Send.
+ 4. Expect 200 data.faceReference.url non-null string reachable via
+    a browser GET (Supabase public bucket = patient-avatars).
+
+EXPECTED HTTP STATUS: 200 OK
+EXPECTED RESPONSE data:
+  {
+    "patientId": "REPLACE_WITH_REAL_PATIENT_ID",
+    "faceReference": {
+      "url": "https://kyxmkhdrnijymlotjynr.supabase.co/storage/v1/object/public/patient-avatars/<uuid>/avatar.jpg",
+      "updatedAt": "2026-09-29T09:45:00.000Z"
+    }
+  }
+The exact bucket/path comes from Patient.avatarUrl; the Supabase
+project-id kyxmkhdrnijymlotjynr is the real value from .env
+SUPABASE_URL.
+
+DATABASE EFFECT:
+  None (read-only). Uses SELECT Patient.id, Patient.avatarUrl,
+  Patient.updatedAt via PrismaPatientRepository.findById.
+
+VERIFICATION:
+  1. Click the faceReference.url in Postman Visualizer or paste into
+     a browser. The image loads (HTTP 200 Content-Type image/jpeg).
+  2. If Patient.avatarUrl is NULL → test 2C applies.
+
+---
+Positive sub-test 2A — Valid patient + valid device
+
+Send the GET URL above with real values. Expect 200 and a valid URL.
+
+---
+Negative sub-test 2B — deviceId does NOT match the MedicineBox that
+"belongs" to the patient (ownership / cross-tenant gate).
+
+Use a patientId from a DIFFERENT userId than the MedicineBox.userId
+who owns the deviceId. (The use-case gates: it loads patient -> user
+owner, then loads medicine boxes of that user -> checks if ANY box
+belonging to that user has the requesting deviceId).
+
+EXPECTED HTTP STATUS: 403 Forbidden
+EXPECTED RESPONSE:
+  {
+    "status": "fail",
+    "statusCode": 403,
+    "message": "This device is not associated with the patient's user account"
+  }
+DB EFFECT: None.
+
+---
+Negative sub-test 2C — Patient has no avatar uploaded yet.
+  Patient.avatarUrl = NULL.
+  EXPECTED HTTP STATUS: 404 Not Found
+  EXPECTED RESPONSE:
+    { "status": "fail", "statusCode": 404,
+      "message": "Patient has no face reference (avatarUrl) uploaded yet" }
+
+---
+Negative sub-test 2D — Missing deviceId (forgetting the query string).
+  URL: {{baseUrl}}/api/devices/patients/{{patientId}}/face-reference
+  (no ?deviceId=...)
+  EXPECTED HTTP STATUS: 400 Bad Request
+  EXPECTED RESPONSE:
+    { "status": "fail", "statusCode": 400,
+      "message": "patientId and deviceId are required (non-empty strings)" }
+
+---
+Negative sub-test 2E — Patient UUID does not exist
+  URL: {{baseUrl}}/api/devices/patients/00000000-0000-0000-0000-000000000000/face-reference?deviceId={{deviceId}}
+  EXPECTED HTTP STATUS: 404 Not Found
+  EXPECTED RESPONSE:
+    { "status": "fail", "statusCode": 404, "message": "Patient not found" }
+
+CURL EQUIVALENT (positive):
+  curl -X GET \
+    "http://localhost:3000/api/devices/patients/REPLACE_PATIENT_UUID/face-reference?deviceId=PI-DEV-001"
+
+============================================================
+TEST #3 — FACE VERIFICATION AUDIT (STEP C of Face Recognition)
+============================================================
+Purpose:
+  After the Raspberry Pi runs its LOCAL face comparison (see #2),
+  the Pi sends a PASS / FAIL decision back to the backend. Backend
+  stores a row in FaceVerificationEvent table.
+  NOTE: Backend does NOT re-verify the face; it trusts the Pi's
+  decision + optional similarity 0..1 score. This is intentional
+  current architecture.
+
+METHOD:      POST
+FULL URL:    {{baseUrl}}/api/devices/face-verification
+AUTH:        Pattern B. "deviceId" inside JSON BODY.
+HEADERS:
+  Content-Type: application/json
+BODY (raw JSON):
+  {
+    "deviceId": "{{deviceId}}",
+    "patientId": "{{patientId}}",
+    "verified": true,
+    "similarity": 0.97
+  }
+Real validator: faceVerificationSchema devices.validator.ts L16–L23
+  - verified must be boolean (strict schema: string "true" rejected)
+  - similarity optional; if provided must be 0..1 inclusive float.
+  - no extra keys allowed due to .strict()
+
+POSTMAN STEPS:
+ 1. New POST request.
+ 2. Paste URL and headers.
+ 3. Body → raw → JSON, paste payload.
+ 4. Send.
+
+EXPECTED HTTP STATUS: 200 OK
+EXPECTED RESPONSE data (verified = true with similarity):
+  {
+    "deviceId": "{{deviceId}}",
+    "patientId": "{{patientId}}",
+    "verified": true,
+    "message": "Face verified successfully",
+    "similarity": 0.97
+  }
+If similarity is NOT provided in the request, the field is omitted
+from the response (devices.controller L189–L191 gating).
+
+DATABASE EFFECT (real Prisma model FaceVerificationEvent):
+  INSERT INTO "FaceVerificationEvent"
+    (id, "deviceId", "patientId", verified, similarity, createdAt, updatedAt)
+    VALUES (gen_random_uuid(),
+            {{deviceId}},
+            {{patientId}},
+            true,
+            0.97,
+            now(), now());
+Note: deviceId FK is nullable in Prisma schema (matches code).
+
+VERIFICATION:
+  Prisma Studio → FaceVerificationEvent → new row. The row's verified
+  column matches what you sent.
+
+---
+Positive sub-test 3A — verified: false, similarity 0.20 (failed match)
+  BODY: {"deviceId":"{{deviceId}}", "patientId":"{{patientId}}",
+         "verified":false, "similarity": 0.20}
+  EXPECTED HTTP STATUS: 200 OK
+  EXPECTED data:
+    { "deviceId":..., "patientId":...,
+      "verified": false,
+      "message": "Face verification failed" }
+  DB EFFECT: row inserted with verified=false.
+
+---
+Positive sub-test 3B — no similarity field
+  BODY: {"deviceId":"{{deviceId}}","patientId":"{{patientId}}","verified":true}
+  EXPECTED 200 data: similarity key ABSENT from response (not null).
+
+---
+Negative sub-test 3C — deviceId / patientId cross-user mismatch
+  (same setup as 2B: patient belongs to a user whose MedicineBox does
+   not have the requesting deviceId).
+  EXPECTED HTTP STATUS: 403 Forbidden
+  EXPECTED: message = cross-association string.
+  DB EFFECT: no row inserted.
+
+---
+Negative sub-test 3D — similarity > 1 or < 0
+  BODY: {"deviceId":"{{deviceId}}","patientId":"{{patientId}}",
+         "verified":true, "similarity": 1.50}
+  EXPECTED 400 message = FACE_VERIFY_INVALID_MSG per formatZodErrors.
+
+---
+Negative sub-test 3E — verified as string (not boolean)
+  BODY: {"deviceId":"{{deviceId}}","patientId":"{{patientId}}","verified":"true"}
+  EXPECTED HTTP STATUS: 400.
+  (zod .strict on the schema + z.boolean() rejects strings,
+   formatZodErrors returns generic FACE_VERIFY_INVALID_MSG).
+
+---
+Negative sub-test 3F — nonexistent patientId
+  EXPECTED 404: Patient not found.
+
+CURL EQUIVALENT (positive, with similarity):
+  curl -X POST "http://localhost:3000/api/devices/face-verification" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "deviceId": "PI-DEV-001",
+      "patientId": "REPLACE_PATIENT_UUID",
+      "verified": true,
+      "similarity": 0.96
+    }'
+
+============================================================
+TEST #4 — SCHEDULE SYNCHRONIZATION (PI PULLS SCHEDULES)
+============================================================
+Purpose:
+  Raspberry Pi (re-)downloads all medication schedules for the
+  patient associated with the device's owner user. Backend is the
+  source of truth. The Pi caches these times locally and uses them
+  to know when to alert the patient / run face verification / open
+  a drawer motor. Schedule is returned sorted ascending by each
+  expanded event HH:MM string.
+
+METHOD:      GET
+FULL URL:    {{baseUrl}}/api/devices/{{deviceId}}/schedule
+AUTH:        Pattern B. deviceId is in URL param (also validated via
+             getDeviceScheduleSchema L25–29). No query string needed.
+HEADERS:     Accept: application/json (optional).
+
+POSTMAN STEPS:
+ 1. New GET.
+ 2. Paste URL; replace {{deviceId}}.
+ 3. Send.
+ 4. Verify schedules[] array length >= 1 (assuming data exists; see
+    step 2 for setup).
+ 5. Within each schedule, verify drawerId, medicationId, times list.
+
+EXPECTED HTTP STATUS: 200 OK
+EXPECTED RESPONSE data:
+  {
+    "patientId": "REPLACE_WITH_REAL_PATIENT_ID",
+    "schedules": [
+      {
+        "scheduleId": "REPLACE_WITH_REAL_SCHEDULE_ID",
+        "medicationId": "REPLACE_WITH_REAL_MEDICATION_ID",
+        "medicationName": "Ibuprofen 200mg",
+        "drawerId": "REPLACE_WITH_REAL_DRAWER_ID",
+        "dosageQuantity": 2,
+        "startDate": "2026-09-01",
+        "endDate": null,
+        "daysOfWeek": [1,2,3,4,5],
+        "times": [
+          "08:00",
+          "14:00",
+          "20:00"
+        ],
+        "isActive": true,
+        "refillReminder": true
+      }
+    ]
+  }
+NOTES on the response (real implementation details from GetDeviceSchedule.ts):
+  - times[] is derived from Schedule.timesPerDay TEXT[] array. Only
+    entries matching the regex /^\d{2}:\d{2}$/ are kept (invalid times
+    filtered, NOT 400-rejected; no warning emitted).
+  - times[] within each schedule is ALWAYS sorted ascending by the
+    HH:MM string in the response (implementation sorts before return).
+  - refillReminder is the raw Schedule.refillReminder boolean (used
+    by Flutter to show "refill soon" banners, not by the Pi).
+  - DrawerMedication IS JOINED to the Schedule row to produce
+    drawerId (it's Schedule.drawerId, nullable on the Prisma level
+    but the filter excludes rows with null drawerId).
+  - The backend ALWAYS returns the COMPLETE expanded list. It does
+    NOT ship a "since" / delta parameter today. Pi should overwrite
+    its entire local cache on every sync.
+
+DATABASE EFFECT:
+  Read-only. SELECTs Schedule + Medication + DrawerMedication.
+
+VERIFICATION:
+  1. Confirm patientId in the response belongs to the correct owner
+     (the User who owns the MedicineBox → owns the Patient).
+  2. Confirm times[0] < times[1] < times[2] (sorted ascending).
+  3. Confirm drawerId is a valid existing Drawer row.
+  4. Confirm dosageQuantity === Schedule.quantity (DB column).
+
+---
+Negative sub-test 4B — deviceId does not exist
+  URL: {{baseUrl}}/api/devices/NO-SUCH-DEVICE/schedule
+  EXPECTED 404: "MedicineBox not found for this deviceId"
+  (No schedules array in the response).
+
+---
+Negative sub-test 4C — deviceId exists but no patient / no schedules
+  Result: 200 OK, data.schedules = [], data.patientId = null (no error)
+  Pi code must handle the empty array gracefully.
+
+CURL EQUIVALENT:
+  curl -X GET "http://localhost:3000/api/devices/PI-DEV-001/schedule"
+
+============================================================
+TEST #5 — MEDICATION EVENT (TAKEN or MISSED)
+============================================================
+Purpose:
+  After the Pi opens a drawer at a schedule time and either the
+  patient takes the pills or misses, the Pi sends this event.
+  Backend validates ownership / cross-device / drawer / schedule /
+  stock level and then records it in MedicationSession.
+  For status TAKEN — DrawerMedication.quantity is decremented by
+  quantityTaken inside a Prisma $transaction (atomic).
+  For status MISSED — quantity does NOT change.
+  Duplicate protection is enforced via Postgres UNIQUE CONSTRAINT on
+  MedicationSession (scheduleId + occurrenceDate + occurrenceTime).
+  A repeat TAKEN or MISSED call for the same schedule occurrence is
+  SAFE (idempotent) — it returns 200 without decrementing again.
+
+METHOD:      POST
+FULL URL:    {{baseUrl}}/api/devices/medication-events
+AUTH:        Pattern B. "deviceId" inside JSON BODY.
+HEADERS:
+  Content-Type: application/json
+BODY (raw JSON):
+  {
+    "deviceId": "{{deviceId}}",
+    "patientId": "{{patientId}}",
+    "scheduleId": "{{scheduleId}}",
+    "drawerId": "{{drawerId}}",
+    "status": "TAKEN",
+    "quantityTaken": 1
+  }
+Real validator (medicationEventSchema L31–L56):
+  - status enum TAKEN | MISSED exactly (case sensitive).
+  - quantityTaken integer.
+  - superRefine rules:
+      if TAKEN  => quantityTaken MUST BE > 0  integer
+      if MISSED => quantityTaken MUST BE 0
+
+POSTMAN STEPS:
+ 1. New POST.
+ 2. Paste URL + headers.
+ 3. Fill real UUID for every field.
+ 4. Call the MISSED TEST first (quantity unchanged) if you want to
+    preserve stock, or call TAKEN if you want the quantity write.
+ 5. Click Send.
+ 6. Save the response result for DB verification.
+
+EXPECTED HTTP STATUS: 200 OK (for TAKEN FIRST CALL)
+EXPECTED RESPONSE data:
+  {
+    "eventId": "uuid-uuid-uuid-uuid",
+    "scheduleId": "{{scheduleId}}",
+    "drawerId": "{{drawerId}}",
+    "medicationId": "{{medicationId}}",
+    "status": "TAKEN",
+    "occurrenceDate": "2026-09-29",
+    "occurrenceTime": "08:00",
+    "quantityTaken": 1,
+    "quantityBefore": 30,
+    "quantityAfter":  29,
+    "drawerStatusAfter": "LOADED",
+    "refillRequired": false,
+    "missingQuantity": 0,
+    "idempotent": false
+  }
+NOTES:
+  - occurrenceDate and occurrenceTime are derived by the use-case by
+    finding the nearest scheduled slot, NOT by using the literal
+    current clock minute.
+  - drawerStatusAfter is the new Drawer.status enum after the update.
+  - refillRequired: if quantityAfter === 0 => true. In that case
+    drawerStatusAfter = "EMPTY" (Prisma enum DrawerStatus: EMPTY |
+    LOADED | LOCKED | DISPENSING | ERROR).
+  - missingQuantity: DrawerMedication.missingQuantity (DB column) is
+    non-nullable int; if you have refillReminder policy this value
+    is filled on the TAKEN path when qty low.
+  - idempotent: boolean flag. First write returns false; duplicate
+    writes return true and ALL the other fields match the original
+    write; no DB quantity change.
+
+DATABASE EFFECT for TAKEN (Prisma $transaction, real tables):
+  (1) INSERT "MedicationSession"
+        (id, scheduleId, patientId, status='PATIENT_TAKEN',
+         occurrenceDate, occurrenceTime, notes, createdAt, updatedAt)
+  (2) UPDATE "DrawerMedication"
+        SET quantity = quantity - {{quantityTaken}},
+            missingQuantity = <computed>, updatedAt = now()
+        WHERE id = drawerMedicationId;
+  (3) IF newQuantity === 0:
+        UPDATE "Drawer" SET status = 'EMPTY', updatedAt=now()
+        WHERE id = drawerId;
+  (4) Unique constraint check:
+        MedicationSession(scheduleId, occurrenceDate, occurrenceTime)
+        UNIQUE; violation caught as Prisma P2002 and treated as
+        idempotent replay -> data.idempotent=true returned.
+
+DATABASE EFFECT for MISSED:
+  Only (1) MedicationSession row with status='MISSED'.
+  DrawerMedication.quantity UNCHANGED.
+  Drawer.status UNCHANGED.
+  Always idempotent (duplicate MISSED returns idempotent=true).
+
+VERIFICATION:
+  Prisma Studio:
+    MedicationSession new row -> status = PATIENT_TAKEN or MISSED.
+    DrawerMedication.quantity = quantityBefore - quantityTaken only
+    when status=TAKEN.
+    If TAKEN took last pill: Drawer.status = EMPTY.
+    Duplicate Send the same payload twice: second response shows
+    idempotent=true and quantityAfter does NOT decrement again.
+
+---
+Positive sub-test 5A — TAKEN (first time; qty decrements)
+  BODY: as above with real IDs.
+  EXPECTED 200, status=TAKEN, idempotent=false, quantityAfter decreased.
+
+---
+Positive sub-test 5B — TAKEN duplicate (retry / network retry)
+  Re-send EXACT same payload as 5A.
+  EXPECTED 200, idempotent=true, quantityBefore and quantityAfter are
+  IDENTICAL to 5A (no second decrement).
+
+---
+Positive sub-test 5C — TAKEN, last pill (qty ends at 0)
+  Prep: Update DrawerMedication.quantity = 1.
+  BODY: quantityTaken: 1, status: "TAKEN"
+  EXPECTED 200:
+    quantityBefore: 1, quantityAfter: 0,
+    refillRequired: true, drawerStatusAfter: "EMPTY"
+  DB: Drawer.status flipped to EMPTY.
+
+---
+Positive sub-test 5D — MISSED
+  BODY:
+    {"deviceId":"{{deviceId}}","patientId":"{{patientId}}",
+     "scheduleId":"{{scheduleId}}","drawerId":"{{drawerId}}",
+     "status":"MISSED","quantityTaken":0}
+  EXPECTED 200 data.status = "MISSED" (not PATIENT_TAKEN).
+  DrawerMedication.quantity BEFORE == AFTER. (Verified in Prisma Studio.)
+
+---
+Negative sub-test 5E — MISSED but quantityTaken > 0 (validator rejects)
+  BODY: status MISSED but quantityTaken = 1
+  EXPECTED HTTP STATUS: 400.
+  MESSAGE: "quantityTaken must be 0 when status is MISSED"
+  (From medicationEventSchema.superRefine L49–L54.)
+
+---
+Negative sub-test 5F — TAKEN but quantityTaken = 0 (validator rejects)
+  EXPECTED 400.
+  MESSAGE: "quantityTaken must be a positive integer when status is TAKEN"
+
+---
+Negative sub-test 5G — Insufficient stock
+  Prerequisite: DrawerMedication.quantity = 2 for that drawer.
+  BODY: status TAKEN, quantityTaken: 100
+  EXPECTED HTTP STATUS: 409 Conflict
+  RESPONSE: message "Insufficient quantity in drawer" (or similar).
+  DB: No UPDATE. Quantity stays at 2.
+
+---
+Negative sub-test 5H — Drawer belongs to a DIFFERENT MedicineBox than
+the requesting device's MedicineBox.
+  Use drawerId2 from a different MedicineBox.
+  EXPECTED 403 Forbidden.
+  DB: No changes.
+
+---
+Negative sub-test 5I — Status string "taken" (lowercase; wrong enum)
+  EXPECTED 400 Invalid enum per zod z.enum().
+
+---
+Negative sub-test 5J — nonexistent scheduleId / patientId / drawerId
+  EXPECTED 404 each.
+
+CURL EQUIVALENT (TAKEN, qty 1):
+  curl -X POST "http://localhost:3000/api/devices/medication-events" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "deviceId": "PI-DEV-001",
+      "patientId": "REPLACE_PATIENT_UUID",
+      "scheduleId": "REPLACE_SCHEDULE_UUID",
+      "drawerId": "REPLACE_DRAWER_UUID",
+      "status": "TAKEN",
+      "quantityTaken": 1
+    }'
+
+CURL EQUIVALENT (MISSED, idempotent, qty 0):
+  curl -X POST "http://localhost:3000/api/devices/medication-events" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "deviceId": "PI-DEV-001",
+      "patientId": "REPLACE_PATIENT_UUID",
+      "scheduleId": "REPLACE_SCHEDULE_UUID",
+      "drawerId": "REPLACE_DRAWER_UUID",
+      "status": "MISSED",
+      "quantityTaken": 0
+    }'
+
+============================================================
+TEST #6 — SENSOR READINGS (DHT11 Temperature + Humidity + Fire Boolean)
+============================================================
+Purpose:
+  The Raspberry Pi polls one DHT11 per drawer plus one fire/gas
+  sensor (per-drawer or whole-box). It posts ONE JSON per drawer
+  per sample. Backend upserts ONE current-state row per drawer in
+  table DrawerSensorState (drawerId FK UNIQUE). No sensor history
+  is kept: every call overwrites the previous row. The Flutter side
+  reads this same row (see tests 7 and 8 below).
+
+METHOD:      POST
+FULL URL:    {{baseUrl}}/api/devices/sensor-readings
+AUTH:        Pattern B. "deviceId" in JSON BODY (overridden by any
+             future req.deviceId middleware when written).
+HEADERS:
+  Content-Type: application/json
+BODY (raw JSON):
+  {
+    "deviceId": "{{deviceId}}",
+    "drawerId": "{{drawerId}}",
+    "temperature": 24.6,
+    "humidity": 58.2,
+    "fireDetected": false
+  }
+Real validator (drawerSensorReadingSchema L58–L88):
+  - temperature: number, .superRefine requires Number.isFinite =>
+                 NaN / Infinity / -Infinity rejected 400 Bad Request.
+                 No absolute min/max clamp enforced (no ">1000°C" block).
+  - humidity:    number, MUST be finite, AND superRefine clamp
+                 0 <= humidity <= 100. Outside => 400.
+  - fireDetected: strict z.boolean() — strings "false" / "true"
+                  rejected.
+  - .strict() on the object — any extra field like "foo": 1 => 400.
+
+POSTMAN STEPS:
+ 1. New POST.
+ 2. Paste URL / headers / JSON.
+ 3. Fill real drawerId that BELONGS to deviceId (see 6H below for
+    cross-device negative test).
+ 4. Send, expect 200.
+ 5. Verify Prisma Studio DrawerSensorState row updated.
+
+EXPECTED HTTP STATUS: 200 OK
+EXPECTED RESPONSE data:
+  {
+    "drawerId": "{{drawerId}}",
+    "temperature": 24.6,
+    "humidity": 58.2,
+    "fireDetected": false,
+    "updatedAt": "2026-09-29T11:15:30.100Z"
+  }
+Response mirrors exactly what was persisted. temperature/humidity
+are nullable in the Prisma DrawerSensorState model but the payload
+ALWAYS sets them because validator requires them.
+
+DATABASE EFFECT (real Prisma model DrawerSensorState, drawerId @unique):
+  UPSERT INTO "DrawerSensorState"
+    (id, "drawerId", temperature, humidity, "fireDetected", createdAt, updatedAt)
+    VALUES (new_uuid_or_row_id_if_exists,
+            {{drawerId}},
+            24.6,
+            58.2,
+            false,
+            COALESCE(existing.createdAt, now()),
+            now());
+  Implementation uses prisma.drawerSensorState.upsert({ where: { drawerId }})
+  => one row per drawer. HISTORY TABLE IS NOT MAINTAINED. ONLY latest
+  reading per drawer exists. If you need trends / charts — not yet.
+
+VERIFICATION:
+  Prisma Studio Table: DrawerSensorState
+    - row for drawerId EXISTS with fields matching request.
+    - updatedAt updated each call.
+    - ROW COUNT: 1. (No new rows created on repeat Send — one only.)
+
+---
+Positive sub-test 6A — Fire alarm TRUE (smoke detected)
+  BODY:
+    {"deviceId":"{{deviceId}}","drawerId":"{{drawerId}}",
+     "temperature": 78.4, "humidity": 15.0, "fireDetected": true}
+  EXPECTED 200. data.fireDetected = true.
+  DB: DrawerSensorState.fireDetected = true.
+  NOTE: Backend does NOT push notifications, webhooks, email, push on
+  fireDetected=true today. Detection is written to DB ONLY. Flutter
+  mobile MUST poll the sensor GET (tests 7/8) to show alarms.
+
+---
+Positive sub-test 6B — Repeat call, same drawer, overwrite
+  Send test 6A once, then send test 6 original (fire=false, temp=24)
+  second. Prisma row shows fireDetected back to false. Overwrite works.
+
+---
+Negative sub-test 6C — humidity 150 (>100) or -5 (<0)
+  BODY: change humidity to 150.
+  EXPECTED HTTP STATUS: 400.
+  MESSAGE: "humidity must be within 0..100 % (impossible value rejected)"
+  DB: no write.
+
+---
+Negative sub-test 6D — temperature=Infinity or "NaN" as string number
+  BODY 1: {"temperature": 1e999}  (overflows to Infinity in JS)
+  BODY 2: {"temperature": NaN}
+  EXPECTED 400 for both: "temperature must be a valid finite number..."
+
+---
+Negative sub-test 6E — fireDetected: "false" (wrong type string)
+  BODY: {"deviceId":"{{deviceId}}","drawerId":"{{drawerId}}",
+         "temperature":24.0,"humidity":50.0,"fireDetected":"false"}
+  EXPECTED 400. (zod boolean strict rejects string).
+
+---
+Negative sub-test 6F — drawerId does not exist in the DB
+  BODY drawerId = 00000000-0000-0000-0000-000000000000
+  EXPECTED 404 "Drawer not found"
+  DB: 0 rows.
+
+---
+Negative sub-test 6G — drawerId exists but DOES NOT BELONG to the
+MedicineBox associated with deviceId (cross-user/cross-box test).
+  Use drawerId2 (a drawer from ANOTHER MedicineBox).
+  EXPECTED HTTP STATUS: 403 Forbidden.
+  MESSAGE: "Drawer does not belong to the MedicineBox for this device"
+  (per RecordDrawerSensorReading.ts use-case ownership gate).
+  DB: 0 writes.
+
+---
+Negative sub-test 6H — nonexistent deviceId
+  EXPECTED 404 "MedicineBox not found for this deviceId".
+
+CURL EQUIVALENT (normal):
+  curl -X POST "http://localhost:3000/api/devices/sensor-readings" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "deviceId": "PI-DEV-001",
+      "drawerId": "REPLACE_DRAWER_UUID",
+      "temperature": 24.6,
+      "humidity": 58.2,
+      "fireDetected": false
+    }'
+
+CURL EQUIVALENT (fireDetected = true):
+  curl -X POST "http://localhost:3000/api/devices/sensor-readings" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "deviceId": "PI-DEV-001",
+      "drawerId": "REPLACE_DRAWER_UUID",
+      "temperature": 78.4,
+      "humidity": 15.0,
+      "fireDetected": true
+    }'
+
+============================================================
+============================================================
+SECTION B: FLUTTER MOBILE SIDE ENDPOINTS (2 IMPLEMENTED)
+============================================================
+
+These endpoints consume the data the Raspberry Pi writes. They are
+JWT protected (Pattern A), not device-protected.
+
+============================================================
+TEST #7 — MOBILE: GET ALL DRAWERS SENSOR STATE (MedicineBox aggregate)
+============================================================
+Purpose:
+  The Flutter dashboard shows the latest DHT11 temperature, humidity,
+  and fire boolean for every drawer inside a specific MedicineBox.
+  It returns ALL drawers (even ones the Pi has never posted a
+  reading for) — those unread drawers have temperature:null,
+  humidity:null, fireDetected:false, updatedAt:null defaults so the
+  UI never crashes on missing.
+
+METHOD:      GET
+FULL URL:    {{baseUrl}}/api/medicine-boxes/{{medicineBoxId}}/sensors
+AUTH:        Pattern A — JWT. Router is wrapped in requireAuth() at
+             medicineBox.routes.ts L7.
+HEADERS:
+  Authorization: Bearer {{token}}
+  Accept: application/json
+BODY: none (GET).
+
+POSTMAN STEPS:
+ 1. Ensure you first ran Request #0 (login) and copied accessToken
+    into the Postman environment {{token}} var (or manually paste
+    the Bearer string here).
+ 2. New GET request.
+ 3. URL = {{baseUrl}}/api/medicine-boxes/{{medicineBoxId}}/sensors
+ 4. Open Headers tab, add Authorization with the JWT.
+ 5. Click Send.
+
+EXPECTED HTTP STATUS: 200 OK
+EXPECTED RESPONSE data:
+  {
+    "medicineBoxId": "REPLACE_WITH_REAL_MEDICINE_BOX_ID",
+    "drawers": [
+      {
+        "drawerId": "REPLACE_WITH_REAL_DRAWER_ID",
+        "drawerIndex": 1,
+        "temperature": 24.6,
+        "humidity": 58.2,
+        "fireDetected": false,
+        "updatedAt": "2026-09-29T11:15:30.100Z"
+      },
+      {
+        "drawerId": "REPLACE_WITH_REAL_DRAWER_ID_2",
+        "drawerIndex": 2,
+        "temperature": null,
+        "humidity": null,
+        "fireDetected": false,
+        "updatedAt": null
+      }
+    ]
+  }
+Real implementation details:
+  - drawerIndex: always Drawer.index integer field (not position in
+    array; the array itself is sorted by drawerIndex ASC).
+  - The use-case performs LEFT JOIN on DrawerSensorState via
+    findManyByDrawerIds. If no row exists for a drawer, it fills the
+    defaults above (never 404).
+  - findByIdAndUserId() security gate runs first: if the JWT user.id
+    does NOT OWN the MedicineBox.id, the entire call 404s (security
+    by obscurity — attackers guessing UUIDs get "not found" even if
+    the box exists under a different user).
+
+DATABASE EFFECT:
+  None (pure SELECTs). MedicineBox + Drawer + DrawerSensorState.
+
+VERIFICATION:
+  1. If you just ran positive test 6 (sensor write) and 6A for both
+     drawers: compare the returned temperature/humidity/fireDetected
+     with the last value you POSTed. They match exactly.
+  2. If you have never written sensor data for drawer #2:
+     temperature/humidity are both null; fireDetected defaulted to
+     false; updatedAt null as shown above. UI should show
+     "No reading yet".
+
+---
+Positive sub-test 7A — fireDetected=true mobile dashboard check
+  Preconditions: drawerId has fireDetected:true (run test 6A).
+  Call this GET.
+  EXPECTED drawers[...drawerId].fireDetected === true is visible in
+  the JSON response. (This is the only current "alert" mechanism.)
+
+---
+Negative sub-test 7B — Missing Bearer token (no Auth header)
+  EXPECTED 401: "No token provided".
+
+---
+Negative sub-test 7C — JWT tampered / expired
+  EXPECTED 401: JwtService verify message (from authMiddleware L25–27).
+
+---
+Negative sub-test 7D — User does NOT own the medicine box
+  Swap medicineBoxId to a MedicineBox row whose userId is NOT the
+  user inside the JWT token (or use a different login).
+  EXPECTED 404 NOT "not owned". (Security by obscurity is intentional
+  to avoid disclosing UUIDs belong to other tenants.)
+
+---
+Negative sub-test 7E — medicineBoxId UUID does not exist
+  EXPECTED 404.
+
+CURL EQUIVALENT (must paste token):
+  curl -X GET "http://localhost:3000/api/medicine-boxes/REPLACE_MEDBOX_UUID/sensors" \
+    -H "Authorization: Bearer REPLACE_WITH_JWT_FROM_LOGIN"
+
+============================================================
+TEST #8 — MOBILE: SINGLE DRAWER SENSOR STATE (optional drawer view)
+============================================================
+Purpose:
+  Drilling into a specific drawer in the Flutter app shows ONLY that
+  drawer's latest DHT11 + fire state. Same ownership gate; same
+  defaults.
+
+METHOD:      GET
+FULL URL:    {{baseUrl}}/api/drawers/{{drawerId}}/sensors
+AUTH:        Pattern A — JWT. drawerRouter.use(requireAuth) drawer.routes.ts L6.
+HEADERS:
+  Authorization: Bearer {{token}}
+
+POSTMAN STEPS:
+ 1. Reuse {{token}} from login (#0).
+ 2. Paste URL, add header, Send.
+
+EXPECTED HTTP STATUS: 200 OK
+EXPECTED RESPONSE data:
+  {
+    "drawerId": "{{drawerId}}",
+    "medicineBoxId": "{{medicineBoxId}}",
+    "temperature": 24.6,
+    "humidity": 58.2,
+    "fireDetected": false,
+    "updatedAt": "2026-09-29T11:15:30.100Z"
+  }
+Same null-default handling if no row yet.
+
+---
+Negative sub-test 8B: non-owner JWT -> 404
+Negative sub-test 8C: no Bearer -> 401
+Negative sub-test 8D: bad drawerId UUID -> 404
+
+CURL EQUIVALENT:
+  curl -X GET "http://localhost:3000/api/drawers/REPLACE_DRAWER_UUID/sensors" \
+    -H "Authorization: Bearer REPLACE_WITH_JWT_FROM_LOGIN"
+
+============================================================
+============================================================
+TEST #9 — MOBILE: POST CREATE DRAWER OPEN COMMAND (User opens drawer)
+============================================================
+Purpose:
+  The Flutter app sends this request when the user taps the "Open
+  Drawer" / "Unlock" button on a drawer view. The backend creates a
+  DeviceCommand row with type=OPEN_DRAWER and status=PENDING. The
+  Raspberry Pi will pick this command up on its next GET poll (Test
+  #10). NO automatic DrawerMedication.quantity decrement and NO
+  automatic MedicationSession record — those only happen when the
+  Pi sends a medication-event (Test #5). Optional reason defaults
+  to "MANUAL" if not provided.
+
+METHOD:      POST
+FULL URL:    {{baseUrl}}/api/drawers/{{drawerId}}/open
+AUTH:        Pattern A — JWT. drawerRouter.use(requireAuth) drawer.routes.ts L6.
+HEADERS:
+  Authorization: Bearer {{token}}
+  Content-Type:  application/json
+
+BODY (raw JSON):
+  {}
+  (or with explicit reason, max 200 chars):
+  { "reason": "Doctors order — evening ref check" }
+  (reason null/omitted/empty -> backend stores "MANUAL")
+
+POSTMAN STEPS:
+ 1. Reuse {{token}} from login (#0). The token must belong to the
+    SAME USER who owns the MedicineBox that contains {{drawerId}}.
+ 2. Populate {{drawerId}} from a real Drawer record (drawer.id
+    whose drawer.medicineBox.userId == token userId).
+ 3. Important prerequisite: that MedicineBox must have a NON-EMPTY
+    deviceId set; otherwise the open command cannot be routed and
+    the backend returns 400. Use PATCH /api/medicine-boxes/:id
+    (ADMIN or owner) to set deviceId first if missing.
+ 4. Paste URL, set Content-Type header, paste Body, Send.
+
+EXPECTED HTTP STATUS: 200 OK
+EXPECTED RESPONSE envelope:
+  {
+    "status": "success",
+    "statusCode": 200,
+    "message": "Drawer open command created successfully",
+    "data": {
+      "commandId": "<new uuid>",
+      "drawerId":  "{{drawerId}}",
+      "deviceId":  "<MedicineBox.deviceId>",
+      "type":      "OPEN_DRAWER",
+      "status":    "PENDING",
+      "createdAt": "2026-09-29T11:20:00.000Z"
+    }
+  }
+
+DATABASE EFFECT (Prisma Studio):
+  INSERT 1 row into DeviceCommand:
+    id           = data.commandId above
+    deviceId     = data.deviceId above  (FK -> MedicineBox.deviceId, Cascade)
+    drawerId     = {{drawerId}}         (FK -> Drawer.id, SetNull)
+    type         = 'OPEN_DRAWER'  (DeviceCommandType enum)
+    status       = 'PENDING'      (DeviceCommandStatus enum default)
+    reason       = 'MANUAL'       or provided reason
+    createdAt    = data.createdAt
+    sentAt       = null    (becomes a date after Test #10 first poll)
+    executedAt   = null    (becomes a date on EXECUTED ack Test #11)
+    error        = null    (set only on FAILED ack Test #11)
+  NO rows inserted into MedicationSession.
+  NO rows updated in DrawerMedication (quantity untouched).
+  (Those only occur when the Pi POSTs /medication-events — Test #5).
+
+---
+Positive sub-test 9A: no body / empty body {} → reason="MANUAL" returned
+Positive sub-test 9B: explicit reason string → data.reason trimmed stored
+Positive sub-test 9C: reason=NULL → treated as omitted, reason="MANUAL"
+Negative sub-test 9D: non-owner JWT (different userId) → 404 (obscurity, NOT 403)
+Negative sub-test 9E: no Bearer → 401
+Negative sub-test 9F: bad UUID drawerId not in DB → 404
+Negative sub-test 9G: drawer owned by user BUT box.deviceId is empty/null → 400 "no deviceId associated"
+Negative sub-test 9H: reason > 200 chars → 400 strict schema reject
+Negative sub-test 9I: extra JSON keys (e.g. "hack":true) → 400 strict() validator reject
+
+CURL EQUIVALENT:
+  curl -X POST "http://localhost:3000/api/drawers/REPLACE_DRAWER_UUID/open" \
+    -H "Authorization: Bearer REPLACE_WITH_JWT_FROM_LOGIN" \
+    -H "Content-Type: application/json" \
+    -d '{ "reason": "Manual open by doctor" }'
+  (curl with empty body: -d '{}')
+
+============================================================
+============================================================
+TEST #10 — RASPBERRY PI: GET POLL PENDING COMMANDS (new queue)
+============================================================
+Purpose:
+  Every poll interval (recommend 500 ms — 2s), the Pi calls this
+  endpoint asking "do you have any pending commands for me?". The
+  backend returns ALL rows for this device where status == PENDING,
+  atomically flips their status → SENT and sets sentAt=now() inside
+  a single $transaction so the SAME command is NEVER returned on a
+  second poll (idempotent: 1st call returns 2 commands; 2nd call
+  returns [] even if Pi calls it again instantly). Commands are
+  returned oldest-first (createdAt ASC) so order is deterministic.
+  Currently only command type exposed is OPEN_DRAWER (lock/unlock
+  motor); future command types can be added without changing this
+  endpoint shape.
+
+METHOD:      GET
+FULL URL:    {{baseUrl}}/api/devices/{{deviceId}}/commands
+             (Alternative fallback: query-param deviceId if you
+              prefer that instead of URL param — backend accepts
+              either via resolveRequestingDeviceId() priority.)
+AUTH:        None. Device auth is by trust in deviceId identity in
+             the URL / query today (the X-Device-Token middleware
+             is commented-out — see DevicesController header comment).
+             Do NOT add Authorization: Bearer here. This is a Pi
+             endpoint, NOT a user endpoint.
+HEADERS:     (none required; Content-Type not needed for GET)
+
+POSTMAN STEPS:
+ 1. Populate {{deviceId}} from a real MedicineBox.deviceId record
+    (exactly the same one that was used for the drawer-open command
+    in Test #9 — so that deviceId owns the PENDING command).
+ 2. Before sending Test #10: send Test #9 at least once (so there
+    is a PENDING row). You can also send Test #9 multiple times to
+    create multiple queued PENDING commands — all should be
+    returned in one poll in ASC createdAt order.
+ 3. Paste URL, Send (first poll).
+ 4. IMPORTANT idempotency check — IMMEDIATELY hit Send again (second
+    poll) before running Test #11. Verify second poll returns
+    commands: [] (empty array), not the same command again.
+
+EXPECTED HTTP STATUS: 200 OK
+EXPECTED RESPONSE envelope:
+  {
+    "status": "success",
+    "statusCode": 200,
+    "data": {
+      "deviceId": "{{deviceId}}",
+      "commands": [
+        {
+          "commandId": "<uuid>",
+          "type":      "OPEN_DRAWER",
+          "drawerId":  "<drawer uuid>",
+          "reason":    "MANUAL",
+          "createdAt": "2026-09-29T11:20:00.000Z"
+        }
+      ]
+    }
+  }
+If no pending commands exist (already flipped to SENT/EXECUTED):
+  commands: []   (still 200 OK, not an error — normal).
+
+DATABASE EFFECT (after Test #10 first poll):
+  For every DeviceCommand returned in data.commands[]:
+    status   PENDING -> SENT    (ATOMIC flip via updateMany inside
+                                 prisma.$transaction to prevent
+                                 duplicate delivery on racey polls)
+    sentAt   null    -> now() timestamp
+  No other tables touched.
+
+---
+Positive sub-test 10A: one pending open-drawer command -> returned, data.commands length 1
+Positive sub-test 10B: multiple pending (created multiple 9 calls) -> returned ASC createdAt, all flipped to SENT
+Positive sub-test 10C: no pending commands -> commands: [] (still 200 OK, no error)
+Positive sub-test 10D: immediate repeat-poll (duplicate) -> empty commands: [] (idempotent)
+Negative sub-test 10E: nonexistent deviceId (no such MedicineBox row with that value) -> 404
+Negative sub-test 10F: empty/whitespace deviceId in URL -> 400 schema validation fail
+Negative sub-test 10G: extra params in query (e.g. ?hack=true) still okay but schema strict; only deviceId field is validated
+
+CURL EQUIVALENT:
+  curl -X GET "http://localhost:3000/api/devices/PI-OPEN-DRAWER-001/commands"
+  (query-param alternative if you pass it that way:)
+  curl -X GET "http://localhost:3000/api/devices/PI-OPEN-DRAWER-001/commands?deviceId=PI-OPEN-DRAWER-001"
+
+============================================================
+============================================================
+TEST #11 — RASPBERRY PI: POST ACK COMMAND RESULT (EXECUTED or FAILED)
+============================================================
+Purpose:
+  After the Pi hardware (servo motor / lock relay) completes the
+  OPEN_DRAWER command from Test #10, the Pi POSTs the real
+  hardware result back so the backend transitions status SENT ->
+  EXECUTED or SENT -> FAILED. This is the ONLY code path that
+  marks a command EXECUTED (Flutter in Test #9 creates PENDING;
+  it never skips straight to EXECUTED — only the physical Pi
+  confirms success/failure). The Pi MUST provide the body.deviceId
+  that MATCHES the command.deviceId ownership: if someone sends
+  the wrong deviceId (trying to hijack-ack another device's
+  command) the backend returns 403 Forbidden explicitly (NOT 404
+  this time; ownership here is explicit cross-device not the
+  mobile-side obscurity pattern).
+
+METHOD:      POST
+FULL URL:    {{baseUrl}}/api/devices/commands/{{commandId}}/result
+             ({{commandId}} must be the exact data.commands[0].commandId
+              returned in Test #10's JSON — not a drawer id.)
+AUTH:        None. Same trust model as Test #10. No JWT.
+HEADERS:
+  Content-Type: application/json
+
+BODY (raw JSON — SUCCESS CASE, 99% of calls):
+  {
+    "deviceId": "{{deviceId}}",
+    "status":   "EXECUTED"
+  }
+
+BODY (raw JSON — FAILURE CASE, edge e.g. motor jam):
+  {
+    "deviceId": "{{deviceId}}",
+    "status":   "FAILED",
+    "error":    "Drawer motor jammed — servo stalled 3 times, max retries exceeded"
+  }
+(Max error length: 1000 chars. Null/omitted error on FAILED -> stored null.)
+
+POSTMAN STEPS:
+ 1. Prerequisite chain: run Test #9 (create command PENDING), then
+    run Test #10 first poll (flip to SENT, you get commandId back).
+    Copy that exact commandId string into Postman variable:
+        commandId = <the returned commandId UUID>
+ 2. Build the URL with this commandId as /commands/:commandId/result.
+ 3. Populate body.deviceId with the SAME deviceId that owns that
+    command (must match row DeviceCommand.deviceId exactly — case
+    sensitive string).
+ 4. Send EXECUTED body. Then separately for a different commandId
+    re-run steps 9 + 10 to get a new SENT command and post FAILED
+    body so both branches are verified.
+
+EXPECTED HTTP STATUS: 200 OK
+EXPECTED RESPONSE envelope (both cases):
+  EXECUTED case:
+  {
+    "status": "success",
+    "statusCode": 200,
+    "data": {
+      "commandId": "<uuid>",
+      "status":    "EXECUTED"
+    }
+  }
+
+  FAILED case:
+  {
+    "status": "success",
+    "statusCode": 200,
+    "data": {
+      "commandId": "<uuid>",
+      "status":    "FAILED"
+    }
+  }
+
+DATABASE EFFECT:
+  EXECUTED: status SENT -> EXECUTED ; executedAt = now() ; error wiped -> null.
+  FAILED:   status SENT -> FAILED   ; executedAt = null    ; error set to body.error (or null if not provided).
+  Note: idempotent. You can send the same EXECUTED/FAILED ack twice
+  and it just returns 200 again (updateResult always returns the
+  same final row — no double state-change issues).
+  NO DrawerMedication.quantity changed.
+  NO MedicationSession inserted. Those only in Test #5.
+
+---
+Positive sub-test 11A: EXECUTED ack (correct deviceId) -> status=EXECUTED, executedAt set in DB
+Positive sub-test 11B: FAILED ack with error message -> status=FAILED, error stored verbatim
+Positive sub-test 11C: FAILED ack with error omitted/null -> status FAILED but DeviceCommand.error column = null
+Positive sub-test 11D: Duplicate EXECUTED ack (re-send same request twice) -> both 200 (idempotent, no error)
+Negative sub-test 11E: body.status lowercase "executed"/"failed" (not enum exact) -> 400 schema reject
+Negative sub-test 11F: body.status not EXECUTED/FAILED e.g. "PENDING", "DONE" -> 400 BadRequest
+Negative sub-test 11G: body.deviceId != the stored DeviceCommand.deviceId (cross-device hijack attempt) -> 403 ForbiddenError EXPLICIT with message not 404
+Negative sub-test 11H: nonexistent commandId (random UUID) -> 404 NotFound
+Negative sub-test 11I: error string > 1000 chars -> 400 schema reject
+Negative sub-test 11J: body missing deviceId field entirely -> 400 schema reject
+Negative sub-test 11K: extra JSON keys in body (e.g. "timestamp" / "temp") -> 400 strict() rejects them
+
+CURL EQUIVALENT:
+  # EXECUTED success
+  curl -X POST "http://localhost:3000/api/devices/commands/REPLACE_COMMAND_UUID/result" \
+    -H "Content-Type: application/json" \
+    -d '{ "deviceId": "PI-OPEN-DRAWER-001", "status": "EXECUTED" }'
+
+  # FAILED with error
+  curl -X POST "http://localhost:3000/api/devices/commands/REPLACE_COMMAND_UUID/result" \
+    -H "Content-Type: application/json" \
+    -d '{ "deviceId": "PI-OPEN-DRAWER-001", "status": "FAILED", "error": "Motor jammed" }'
+
+============================================================
+============================================================
+TEST #12 — MOBILE: POST CREATE DRAWER CLOSE COMMAND (User closes drawer)
+============================================================
+Purpose:
+  The Flutter app sends this request when the user taps the "Close
+  Drawer" / "Lock" button on a drawer view. The backend creates a
+  DeviceCommand row with type=CLOSE_DRAWER and status=PENDING. The
+  Raspberry Pi will pick this command up on its next GET poll
+  (Test #10, which returns BOTH OPEN_DRAWER and CLOSE_DRAWER
+  commands since those are both queued through the same DeviceCommand
+  table — no new endpoint, no duplicate polling needed). NO
+  automatic DrawerMedication.quantity decrement/increment and NO
+  automatic MedicationSession record — those only happen when the Pi
+  sends a medication-event (Test #5). Optional reason defaults to
+  "MANUAL" if not provided.
+
+METHOD:      POST
+FULL URL:    {{baseUrl}}/api/drawers/{{drawerId}}/close
+AUTH:        Pattern A — JWT. drawerRouter.use(requireAuth) drawer.routes.ts L6.
+HEADERS:
+  Authorization: Bearer {{token}}
+  Content-Type:  application/json
+
+BODY (raw JSON):
+  {}
+  (or with explicit reason, max 200 chars):
+  { "reason": "Manual close by doctor" }
+  (reason null/omitted/empty -> backend stores "MANUAL")
+
+POSTMAN STEPS:
+ 1. Reuse {{token}} from login (#0). Token must belong to the SAME
+    USER who owns the MedicineBox containing {{drawerId}}.
+ 2. Populate {{drawerId}} from a real Drawer record (drawer.id
+    whose drawer.medicineBox.userId == token userId).
+ 3. Prerequisite: MedicineBox must have NON-EMPTY deviceId set;
+    otherwise backend returns 400.
+ 4. Paste URL, set Content-Type header, paste Body, Send.
+
+EXPECTED HTTP STATUS: 200 OK
+EXPECTED RESPONSE envelope:
+  {
+    "status": "success",
+    "statusCode": 200,
+    "message": "Drawer close command created successfully",
+    "data": {
+      "commandId": "<new uuid>",
+      "drawerId":  "{{drawerId}}",
+      "deviceId":  "<MedicineBox.deviceId>",
+      "type":      "CLOSE_DRAWER",
+      "status":    "PENDING",
+      "createdAt": "2026-09-30T11:20:00.000Z"
+    }
+  }
+
+DATABASE EFFECT (Prisma Studio):
+  INSERT 1 row into DeviceCommand:
+    id        = data.commandId above
+    deviceId  = data.deviceId (FK MedicineBox.deviceId Cascade)
+    drawerId  = {{drawerId}}  (FK Drawer.id SetNull)
+    type      = 'CLOSE_DRAWER' (enum DeviceCommandType value added
+                                 in migration 0016)
+    status    = 'PENDING'
+    reason    = 'MANUAL' or provided reason
+    createdAt = data.createdAt
+    sentAt = NULL ; executedAt = NULL ; error = NULL
+  NO MedicationSession rows inserted.
+  NO DrawerMedication.quantity touched (no increment / decrement).
+  (Those only occur on Test #5 POST /api/devices/medication-events.)
+
+---
+Positive sub-test 12A: no body / empty body {} → reason="MANUAL" returned
+Positive sub-test 12B: explicit reason string → data.reason trimmed stored
+Positive sub-test 12C: reason=NULL → treated as omitted, reason="MANUAL"
+Negative sub-test 12D: non-owner JWT (different userId) → 404 obscurity NOT 403
+Negative sub-test 12E: no Bearer token → 401 Unauthorized (requireAuth)
+Negative sub-test 12F: drawer UUID not exist → 404 NotFound
+Negative sub-test 12G: drawer owned but box.deviceId empty/null → 400 BadRequest "no deviceId associated"
+Negative sub-test 12H: reason > 200 chars → 400 strict() reject
+Negative sub-test 12I: extra unknown keys (e.g. "hack":true) → 400 strict() rejects
+
+CURL EQUIVALENT:
+  curl -X POST "http://localhost:3000/api/drawers/REPLACE_DRAWER_UUID/close" \
+    -H "Authorization: Bearer REPLACE_WITH_JWT_FROM_LOGIN" \
+    -H "Content-Type: application/json" \
+    -d '{ "reason": "Manual close by doctor" }'
+  (empty body: -d '{}')
+
+============================================================
+============================================================
+15. REFILL WORKFLOW (FEATURE: PARTIAL IMPLEMENTATION — RPi side)
+============================================================
+The REFILL hardware workflow endpoints were inspected via full-code
+grep. The following concepts still return 0 matches for the generic
+events/REFILL COMPLETED side (OPEN_DRAWER + CLOSE_DRAWER command
+queue IS now implemented per TEST #9/10/11/12 above):
+
+  REFILL_COMPLETED  refillCompleted
+  device-events    events    /events    (the medication-events
+                                        route is unrelated; it is
+                                        NOT a generic event endpoint)
+  mqtt   MQTT   amqp   rabbit
+  ws   WebSocket   socket.io   push   notification
+  fireDetected -> notification, webhook, sms, email
+
+Search terms that NOW have matches (implemented for Drawer-Open
+feature):
+  open-drawer  openDrawer  OPEN_DRAWER      -> YES (see TEST 9/10/11)
+  device-commands  commands  /commands      -> YES (GET /:deviceId/commands
+                                                 + POST /commands/:id/result)
+  (motorControl/motor/unlock/lock/relay)    -> OPEN_DRAWER command itself
+                                                 exposed (physical motor
+                                                 drive happens on Pi FW).
+
+Result for every bullet in spec §15:
+
+  POST /api/medicine-boxes/:medicineBoxId/drawers/:drawerId/refill
+    -> NOT IMPLEMENTED. No refill-specific endpoint exposed under
+       /api/medicine-boxes or /api/devices at all.
+
+  POST /api/devices/commands (generic enqueue endpoint)
+    -> NOT IMPLEMENTED as generic enqueue. HOWEVER, the DEVICE
+       COMMAND QUEUE DOES EXIST (Prisma model DeviceCommand, repo,
+       use-cases, 2 new Pi routes) with 3 new endpoints:
+         (A) Flutter enqueues OPEN_DRAWER via Test #9:
+                 POST /api/drawers/:drawerId/open
+         (B) Pi polls pending commands Test #10:
+                 GET  /api/devices/:deviceId/commands
+         (C) Pi acks result Test #11:
+                 POST /api/devices/commands/:commandId/result
+       The devices router now exposes 8 routes total (the original 6
+       heartbeat/face-ref/face-verif/schedule/medication-events/
+       sensor-readings + 2 above).
+
+  POST /api/devices/events
+    -> NOT IMPLEMENTED. A specific medication event POST exists but a
+       generic device event endpoint (for REFILL_COMPLETED / DRAWER_OPENED
+       / DRAWER_CLOSED / etc.) does NOT exist.
+
+  OPEN_DRAWER command sent from Backend to Raspberry Pi
+    -> NOW IMPLEMENTED VIA HTTP POLLING (no push). Details:
+       - GET /api/devices/:deviceId/commands returns all PENDING
+         commands; atomically flips their status -> SENT so the same
+         command is NEVER returned twice on repeat polls.
+       - Still NO WebSocket / MQTT / SSE push channel exists
+         (those remain non-goals / not implemented).
+
+What DOES exist around "refill" + "open command" in current codebase:
+  1. Schedule.refillReminder boolean (DB column).
+  2. DrawerMedication.missingQuantity int column (calculated on TAKEN
+     when qty drops below threshold).
+  3. Medication TAKEN endpoint returns refillRequired=true +
+     drawerStatusAfter=EMPTY when qty reaches 0 (test #5C).
+  4. Drawer.status ENUM includes DrawerStatus.EMPTY.
+  5. For ADMINs, the CRUD endpoint PATCH /api/drawer-medications/:id
+     exists with JWT + requireRole("ADMIN") that allows updating
+     DrawerMedication.quantity / missingQuantity fields directly via
+     HTTP (Postman test for that endpoint is NOT a RPi test; use
+     ADMIN login token pattern A and the drawerMedication router).
+     An operator can manually increase quantity that way during a
+     physical refill walkaround.
+  6. NEW — DeviceCommand table + repositories + 3 endpoints
+     (Tests #9 / #10 / #11 above) that provide an OPEN_DRAWER command
+     queue for the Flutter -> Pi unlock flow. Today this is used for
+     manual drawer unlock; it is reusable as the transport layer for
+     a future REFILL flow (REFILL-type command added alongside
+     OPEN_DRAWER, no new route structure required).
+
+What would still be needed to fully implement the spec §15 full
+REFILL workflow (NOT written here because "do not invent endpoints
+that aren't explicitly requested" rule applies):
+  - New DeviceCommandType.REFILL constant added alongside OPEN_DRAWER
+    (in Prisma enum DeviceCommandType + domain type alias) — the table
+    + routes already exist so this is an enum extension, not new
+    endpoint code.
+  - POST /api/medicine-boxes/:id/drawers/:drawerId/refill (Flutter
+    ADMIN creates command + pending REFILL state with
+    quantityRequested) — new controller + use-case, reuses
+    CreateDrawerOpenCommand pattern / DeviceCommand repo.
+  - POST /api/devices/events generic endpoint with event enum
+    REFILL_COMPLETED | DRAWER_OPENED | DRAWER_CLOSED | MOTOR_ERROR
+    + handler that increments DrawerMedication.quantity from the
+    pending REFILL state when REFILL_COMPLETED event arrives with
+    matching correlationId (= DeviceCommand.id).
+  - Duplicate REFILL_COMPLETED idempotency protection (on unique
+    (commandId, eventType) key or DrawerMedicationEventProcessor
+    P2002 retry pattern identical to TAKEN/MISSED).
+  - Validation that REFILL_COMPLETED corresponds to a real pending
+    OPEN_DRAWER / REFILL DeviceCommand (not orphaned).
+  - Drawer capacity cap (qty + refill > maxDrawerCapacity -> 400).
+
+============================================================
+============================================================
+16. COMPLETE END-TO-END Postman SCENARIO (MEDICATION TAKEN + SENSORS)
+============================================================
+This scenario runs all RPi endpoints in the exact order the real
+physical device would execute them during one morning dose.
+Prerequisite: every section 2 variable is populated and the backend
+runs at {{baseUrl}}.
+
+------------------------------------------------------------
+STEP 1.  Bootstrap — Get a JWT (for mobile sensor GETs at steps 9-10)
+------------------------------------------------------------
+REQUEST:
+  POST {{baseUrl}}/api/auth/login
+  BODY: {"email":"superborgi@med.com","password":"SecurePassword123!"}
+EXPECTED: 200, copy data.accessToken -> Postman var {{token}}.
+
+------------------------------------------------------------
+STEP 2.  Device announces it is online.
+------------------------------------------------------------
+REQUEST (heartbeat):
+  POST {{baseUrl}}/api/devices/heartbeat
+  BODY: {"deviceId":"{{deviceId}}"}
+EXPECTED: 200 data.status = ACTIVE.
+Verify Prisma: MedicineBox.lastSeenAt refreshed.
+
+------------------------------------------------------------
+STEP 3.  Pi downloads today's schedule.
+------------------------------------------------------------
+REQUEST:
+  GET {{baseUrl}}/api/devices/{{deviceId}}/schedule
+EXPECTED: 200 data.schedules non-empty.
+Save schedules[0].scheduleId / drawerId / patientId / medicationId
+to variables if not already.
+
+------------------------------------------------------------
+STEP 4.  Pi downloads patient face reference.
+------------------------------------------------------------
+REQUEST:
+  GET {{baseUrl}}/api/devices/patients/{{patientId}}/face-reference?deviceId={{deviceId}}
+EXPECTED: 200 faceReference.url non-null and loads in browser.
+
+------------------------------------------------------------
+STEP 5.  Pi performs face match locally.
+         This step DOES NOT hit the backend. Manual action only.
+         Decision: VERIFIED. Confidence: 0.96
+
+------------------------------------------------------------
+STEP 6.  Pi reports the verification result.
+------------------------------------------------------------
+REQUEST:
+  POST {{baseUrl}}/api/devices/face-verification
+  BODY: {"deviceId":"{{deviceId}}","patientId":"{{patientId}}",
+         "verified":true,"similarity":0.96}
+EXPECTED: 200 verified=true, similarity echoed.
+
+------------------------------------------------------------
+STEP 7.  Pi unlocks the drawer motor, patient takes 1 pill.
+         (This step DOES NOT hit the backend; real Pi hardware does it).
+
+------------------------------------------------------------
+STEP 8.  Pi confirms PATIENT_TAKEN to backend + decrements stock.
+------------------------------------------------------------
+REQUEST:
+  POST {{baseUrl}}/api/devices/medication-events
+  BODY: {"deviceId":"{{deviceId}}","patientId":"{{patientId}}",
+         "scheduleId":"{{scheduleId}}","drawerId":"{{drawerId}}",
+         "status":"TAKEN","quantityTaken":1}
+EXPECTED: 200 quantityAfter = quantityBefore-1, idempotent=false.
+Verify Prisma Studio:
+  DrawerMedication.quantity decreased by 1.
+  MedicationSession new row with PATIENT_TAKEN.
+  If the new quantity hit 0 -> Drawer.status = EMPTY, refillRequired=true.
+
+------------------------------------------------------------
+STEP 9.  Pi reads DHT11 + fire sensor once per drawer, POSTs.
+------------------------------------------------------------
+REQUEST (drawer 1):
+  POST {{baseUrl}}/api/devices/sensor-readings
+  BODY: {"deviceId":"{{deviceId}}","drawerId":"{{drawerId}}",
+         "temperature":24.6,"humidity":58.2,"fireDetected":false}
+EXPECTED: 200 data updatedAt recent.
+
+REQUEST (drawer 2):
+  POST {{baseUrl}}/api/devices/sensor-readings
+  BODY: {"deviceId":"{{deviceId}}","drawerId":"{{drawerId2}}",
+         "temperature":25.1,"humidity":60.4,"fireDetected":false}
+EXPECTED: 200.
+
+------------------------------------------------------------
+STEP 10. Mobile dashboard refreshes — reads all sensors.
+------------------------------------------------------------
+REQUEST:
+  GET {{baseUrl}}/api/medicine-boxes/{{medicineBoxId}}/sensors
+  Header: Authorization: Bearer {{token}}
+EXPECTED: 200 drawers array length = 2; temperatures 24.6 / 25.1;
+          humidities 58.2 / 60.4; fireDetected all false.
+
+------------------------------------------------------------
+STEP 11. (Optional) Fire alarm simulation.
+------------------------------------------------------------
+POST sensor-readings again for drawerId with fireDetected:true
+(temperature: 78, humidity: 15, fireDetected: true).
+Then call GET medicine-boxes/:id/sensors again.
+EXPECTED: that drawer.fireDetected === true (alert shown on Flutter).
+
+------------------------------------------------------------
+REFILL E2E STEPS (NOT IMPLEMENTED — would appear here once the
+§15 endpoints are added). Currently the recommended manual
+operator workaround for a physical refill is:
+  1. ADMIN opens Prisma Studio (or uses PATCH /api/drawer-medications/:id
+     via Postman with ADMIN JWT)
+  2. Manually sets DrawerMedication.quantity = new qty after refill.
+  3. Optionally sets Drawer.status back to LOADED if it was EMPTY.
+
+============================================================
+============================================================
+17. DATABASE VERIFICATION CHECKLIST (real Prisma model / field names)
+============================================================
+After the scenario above, open Prisma Studio (npx prisma studio) and
+check the following tables / columns for their expected values:
+
+After TEST #1 heartbeat:
+  [Table] MedicineBox
+    MedicineBox.deviceId          = {{deviceId}}
+    MedicineBox.deviceStatus      = 'ACTIVE'
+    MedicineBox.lastSeenAt        = recent timestamp within 5s
+
+After >DEVICE_OFFLINE_THRESHOLD_MS (5s default) WITHOUT heartbeat:
+  MedicineBox.deviceStatus      -> flips back to 'OFFLINE' by the
+                                   background monitor.
+
+After TEST #3 face verification:
+  [Table] FaceVerificationEvent
+    FaceVerificationEvent.deviceId   = {{deviceId}}
+    FaceVerificationEvent.patientId  = {{patientId}}
+    FaceVerificationEvent.verified   = true (or false per test)
+    FaceVerificationEvent.similarity = 0.96 if provided
+
+After TEST #5 TAKEN 1 pill:
+  [Table] MedicationSession
+    MedicationSession.status       = 'PATIENT_TAKEN'
+    MedicationSession."scheduleId" = {{scheduleId}}
+    MedicationSession."occurrenceDate" = today
+    MedicationSession."occurrenceTime" = e.g. 08:00
+  [Table] DrawerMedication
+    DrawerMedication.quantity      = (before) minus 1
+    DrawerMedication."updatedAt"   = recent timestamp
+  [Table] Drawer
+    If DrawerMedication.quantity became 0:
+      Drawer.status                = 'EMPTY'
+
+After TEST #5 MISSED:
+  [Table] MedicationSession
+    MedicationSession.status       = 'MISSED'
+  DrawerMedication.quantity        = SAME as before MISSED call.
+  Drawer.status                     = unchanged.
+
+After TEST #6 sensor POST (per drawer):
+  [Table] DrawerSensorState
+    DrawerSensorState."drawerId"      = {{drawerId}} (UNIQUE)
+    DrawerSensorState.temperature     = 24.6
+    DrawerSensorState.humidity        = 58.2
+    DrawerSensorState."fireDetected"  = false
+    DrawerSensorState."updatedAt"     = recent timestamp.
+  Row COUNT per drawer = 1 (upsert overwrites; never 2 rows).
+
+After TEST #7 / #8 mobile GET (read-only):
+  No DB writes. All selects. The only table involved is the one
+  above LEFT JOINed through Drawer → MedicineBox.
+
+============================================================
+============================================================
+18. ERROR TESTING MATRIX (status codes the implementation ACTUALLY returns)
+============================================================
+Only the codes below are produced by existing AppError subclasses.
+The backend does NOT emit 422, 409 on validation, or other codes
+outside this list (today only conflict 409 exists for insufficient
+stock during medication TAKEN).
+
+HTTP 400 Bad Request
+  Source: BadRequestError class.
+  Scenarios:
+    * Heartbeat validator L3-7: missing deviceId, non-string, extra keys.
+    * Face reference: missing patientId or deviceId.
+    * Face verification payload missing a field or wrong type.
+    * Schedule sync deviceId in URL is empty string.
+    * Medication event: invalid TAKEN/MISSED quantity rules.
+    * Sensor reading: humidity outside 0..100, temperature non-finite,
+      fireDetected non-boolean, any extra keys due to schema .strict().
+
+HTTP 401 Unauthorized
+  Source: UnauthorizedError class (authMiddleware.ts).
+  Scenarios:
+    * Pattern A endpoint (/api/medicine-boxes/:id/sensors or /api/drawers)
+      called WITHOUT Authorization: Bearer header: "No token provided".
+    * JWT expired / malformed / wrong signature.
+    * Login with wrong password: "Invalid credentials".
+
+HTTP 403 Forbidden
+  Source: ForbiddenError class.
+  Scenarios:
+    * requireRole middleware mismatch (e.g. USER calls POST /api/medicine-boxes/
+      which is requireRole ADMIN). For device endpoints: use-case ownership
+      gates: deviceId + patientId mismatch; drawerId from another box; etc.
+    * Face reference / face verification / medication event / sensor post
+      all cross-validate that the resource belongs to the device owner user.
+
+HTTP 404 Not Found
+  Source: NotFoundError class (used in every use-case on findById return null,
+  plus deviceId → MedicineBox lookup; drawerId → Drawer lookup; patientId →
+  Patient lookup).
+  Scenarios:
+    * Heartbeat / schedule-sync: nonexistent deviceId.
+    * Face reference: nonexistent patientId OR patient has no avatar.
+    * Medication event: nonexistent scheduleId / patientId / drawerId.
+    * Sensor reading: nonexistent deviceId OR drawerId.
+    * Mobile sensor GET: MedicineBox.id not found OR Drawer.id not found.
+    * Mobile sensor GET: JWT user is NOT the owner (security by obscurity
+      → 404, not 403).
+
+HTTP 409 Conflict
+  Source: ConflictError class.
+  Scenarios:
+    * TAKEN medication event: DrawerMedication.quantity < quantityTaken
+      ("Insufficient quantity...").
+    * (Other 409s in the CRUD endpoints are out of scope for RPi guide.)
+
+HTTP 500 Internal Server Error
+  Source: errorMiddleware.ts catch-all.
+  Scenarios (intentional; only for real bugs never caught by above):
+    DB connectivity issues (P1001 / P1002), unexpected runtime exceptions.
+    RPi endpoints should never return 500 under normal conditions.
+
+============================================================
+============================================================
+19. RECOMMENDED Postman REQUEST EXECUTION ORDER (11 steps)
+============================================================
+Due to dependencies (login produces a token; heartbeat marks device
+online; face-ref must run before face-ver; medication-events depend
+on existing schedules/drawers/meds):
+
+ [Step 1]  Start backend: npm run dev.
+ [Step 2]  GET {{baseUrl}}/health → confirm HTTP 200 {status:ok}.
+ [Step 3]  Confirm DB reachable: backend console must NOT show
+           P1001 / P1002 errors. If it does: fix pooler creds or
+           Supabase project state BEFORE continuing.
+ [Step 4]  LOGIN REQUEST #0 → capture {{token}}.
+ [Step 5]  Populate remaining Postman variables (deviceId, medicineBoxId,
+           patientId, drawerId, drawerId2, scheduleId, medicationId)
+           via Prisma Studio (section 2).
+ [Step 6]  TEST #1   Heartbeat positive (device becomes ACTIVE).
+ [Step 7]  TEST #4   Schedule sync GET.
+ [Step 8]  TEST #2   Face reference GET.
+ [Step 9]  TEST #3   Face verification POST verified:true, similarity.
+ [Step 10] TEST #5D  Medication MISSED event (no stock change, safe).
+ [Step 11] TEST #5A  Medication TAKEN event 1 pill (stock decrements).
+ [Step 12] TEST #6   Sensor POST drawer 1 — normal 24C / 58% / no fire.
+ [Step 13] TEST #6A  Sensor POST drawer 1 — fireDetected:true alarm.
+ [Step 14] TEST #7   Mobile GET all drawers sensors. Verify the true
+                     shows up on the JSON for drawerId 1.
+ [Step 15] TEST #8   Mobile GET single drawer sensors (optional).
+ [Step 16] Negative matrix 1B, 1C, 2B, 2C, 2D, 2E, 3C, 3D, 3E, 3F,
+                      4B, 4C, 5B, 5C, 5D, 5E, 5F, 5G, 5H, 5I, 5J,
+                      6B, 6C, 6D, 6E, 6F, 6G, 6H,
+                      7B, 7C, 7D, 7E, 8B, 8C, 8D.
+ [Step 17] (NOT IMPLEMENTED — skipped) Refill positive / negative tests.
+
+============================================================
+============================================================
+19. GET /api/devices/medication-events  (Medication Event History)
+============================================================
+A read-only endpoint that returns MedicationSession records
+(sorted by scheduledAt DESC) with optional filters and
+pagination. Supports TWO callers:
+
+  A) Mobile (JWT auth):
+       Authorization: Bearer {{token}}
+       (optionally also pass deviceId/patientId/etc. filters)
+     -> Results are scoped to patients owned by the JWT's userId.
+
+  B) Raspberry Pi (no JWT):
+       Pass ?deviceId={{deviceId}}
+     -> Results are scoped to that single device.
+
+If neither a Bearer token NOR a deviceId query param is provided,
+the server returns HTTP 401 Unauthorized.
+
+QUERY PARAMETERS (all optional, validated strictly):
+  deviceId    string   filter by device (drawer.medicineBox.deviceId)
+  patientId   string   filter by patient
+  scheduleId  string   filter by medication schedule
+  drawerId    string   filter by drawer
+  status      string   TAKEN | MISSED | PATIENT_TAKEN | PATIENT_SKIPPED |
+                       FACE_RECOGNITION_FAILED | DISPENSING_FAILED |
+                       DEVICE_FAILURE
+                       (TAKEN maps to DB result PATIENT_TAKEN)
+  limit       int      1..100 (default 20, max 100)
+  offset      int      >= 0   (default 0)
+
+UNKNOWN query parameters are rejected with HTTP 400.
+
+EXAMPLE REQUESTS:
+
+  Mobile (JWT) — all events for the caller's patients:
+    GET {{baseUrl}}/api/devices/medication-events
+    Header: Authorization: Bearer {{token}}
+
+  Mobile (JWT) — only TAKEN events for one patient:
+    GET {{baseUrl}}/api/devices/medication-events?patientId={{patientId}}&status=TAKEN
+    Header: Authorization: Bearer {{token}}
+
+  Raspberry Pi — events for one device, paginated:
+    GET {{baseUrl}}/api/devices/medication-events?deviceId={{deviceId}}&limit=20&offset=0
+
+EXPECTED RESPONSE (HTTP 200):
+  {
+    "status": "success",
+    "statusCode": 200,
+    "data": {
+      "events": [
+        {
+          "id": "uuid",
+          "deviceId": "DEV-BOX-...",
+          "patientId": "uuid",
+          "scheduleId": "uuid",
+          "drawerId": "uuid",
+          "medicationId": "uuid",
+          "status": "TAKEN",          // TAKEN | MISSED | raw MedicationSessionResult
+          "quantityTaken": 1,
+          "quantityBefore": 20,
+          "quantityAfter": 19,
+          "scheduledAt": "2026-10-13T06:00:00.000Z",
+          "completedAt": "2026-10-13T06:00:05.000Z",
+          "createdAt": "2026-10-13T06:00:00.000Z",
+          "occurrenceDate": "2026-10-13",
+          "occurrenceTime": "06:00"
+        }
+      ],
+      "pagination": {
+        "limit": 20,
+        "offset": 0,
+        "total": 1
+      }
+    }
+  }
+
+NOTE: quantityTaken = quantityBefore - quantityAfter (0 for MISSED).
+      status TAKEN  <-> DB result PATIENT_TAKEN
+      status MISSED <-> DB result MISSED
+
+NEGATIVE TESTS:
+  - No token + no deviceId -> HTTP 401 Unauthorized
+  - Invalid Bearer token    -> HTTP 401 Unauthorized
+  - limit=0 or limit=101    -> HTTP 400 Bad Request
+  - offset=-1               -> HTTP 400 Bad Request
+  - status=INVALID          -> HTTP 400 Bad Request
+  - Unknown query param     -> HTTP 400 Bad Request
+
+============================================================
+============================================================
+20. FINAL POSTMAN CHECKLIST
+============================================================
+Tick every box after the corresponding Postman run:
+
+[ ] Backend running (npm run dev, no P1001 in console)
+[ ] Database connected (backend logs show no Prisma init errors)
+[ ] GET /health returns {"status":"ok"} HTTP 200
+[ ] Admin login (Request #0) works and JWT copied
+[ ] All 7 Postman variables populated from real DB rows (section 2)
+
+DEVICE:
+[ ] Test 1A — Heartbeat succeeds (ACTIVE, lastSeen updated)
+[ ] Test 1B — Heartbeat invalid deviceId returns 404
+[ ] Test 1C — Heartbeat missing/extra keys returns 400
+[ ] Offline monitor works (wait >5s, deviceStatus back to OFFLINE)
+
+FACE:
+[ ] Test 2A — Face reference returns valid Supabase public URL
+[ ] Test 2B — Face reference cross-device -> 403
+[ ] Test 2C — Patient has no avatar -> 404
+[ ] Test 2D — Missing deviceId query -> 400
+[ ] Test 3A — Face verified true with similarity
+[ ] Test 3B — Face verified false / no similarity (field absent)
+[ ] Test 3C — Face cross-device mismatch -> 403
+[ ] Test 3D — Similarity out of 0..1 -> 400
+[ ] Test 3E — String "true" not boolean -> 400
+
+SCHEDULE:
+[ ] Test 4 — GET schedule returns non-empty schedules[] array
+[ ] Schedule times sorted ascending HH:MM
+[ ] Each schedule has drawerId + medicationId + dosageQuantity
+[ ] Test 4B — Invalid deviceId -> 404
+[ ] Test 4C — Empty schedule list returned as 200 []
+
+MEDICATION:
+[ ] Test 5D — MISSED event, stock unchanged
+[ ] Test 5A — TAKEN event 1 pill, stock decremented 1
+[ ] Test 5B — TAKEN duplicate, idempotent=true, NO double decrement
+[ ] Test 5C — Last pill TAKEN: qty 0, refillRequired=true, Drawer=EMPTY
+[ ] Test 5E — MISSED with qty>0 validator -> 400
+[ ] Test 5F — TAKEN with qty=0 validator -> 400
+[ ] Test 5G — Insufficient stock TAKEN -> 409 Conflict
+[ ] Test 5H — Wrong drawer cross-box -> 403
+[ ] Test 5I — Lowercase "taken" -> 400 enum
+[ ] Test 5J — nonexistent scheduleId -> 404
+
+SENSORS (Raspberry Pi -> POST):
+[ ] Test 6 — Normal temp/hum/fire POST write returns 200
+[ ] Test 6B — Repeat overwrites (single DB row)
+[ ] Test 6A — fireDetected=true persisted correctly
+[ ] Test 6C — humidity>100 or <0 -> 400
+[ ] Test 6D — temperature non-finite (Infinity/NaN) -> 400
+[ ] Test 6E — fireDetected string -> 400
+[ ] Test 6F — drawerId not found -> 404
+[ ] Test 6G — drawerId from another MedicineBox -> 403
+[ ] Test 6H — nonexistent deviceId -> 404
+[ ] Only 1 DrawerSensorState row per drawer after multiple calls
+
+SENSORS (Flutter mobile -> GET):
+[ ] Test 7 — MedicineBox/:id/sensors list with len=num drawers
+[ ] Test 7A — fireDetected=true visible on matching drawer JSON
+[ ] Test 7B — No Bearer -> 401
+[ ] Test 7D — Non-owner JWT -> 404 (obscurity)
+[ ] Test 7E — Medbox UUID not exist -> 404
+[ ] Test 8  (optional) — Drawer/:id/sensors single drawer
+
+DRAWER OPEN COMMAND (Mobile + Pi new feature):
+[ ] Test 9A  — POST drawers/:drawerId/open empty body {} → success message "Drawer open command created successfully", status PENDING, reason MANUAL
+[ ] Test 9B  — POST with explicit reason → data.reason trimmed stored correctly
+[ ] Test 9C  — drawerRouter literal-first route mounted BEFORE generic /:id so param doesn't hijack "open"
+[ ] Test 9D  — non-owner JWT → 404 (security-by-obscurity, NOT 403)
+[ ] Test 9E  — no JWT Bearer → 401 requireAuth
+[ ] Test 9F  — missing UUID drawerId → 404 NotFoundError
+[ ] Test 9G  — MedicineBox.deviceId is empty/whitespace → 400 "no deviceId associated" BadRequest
+[ ] Test 9H  — reason > 200 chars → 400 schema strict reject
+[ ] Test 9I  — extra unknown JSON keys → 400 strict() rejected
+[ ] Test 10A — GET /devices/:deviceId/commands FIRST poll → returns pending command(s) list, status flipped DB-side to SENT
+[ ] Test 10B — GET /devices/:deviceId/commands SECOND poll (instant repeat) → empty commands: [] idempotent
+[ ] Test 10C — GET nonexistent deviceId → 404 NotFound
+[ ] Test 10D — GET empty/whitespace deviceId → 400 BadRequest schema
+[ ] Test 11A — POST EXECUTED ack (correct deviceId) → status EXECUTED, executedAt timestamp set
+[ ] Test 11B — POST FAILED ack with error string → status FAILED, DeviceCommand.error stored verbatim
+[ ] Test 11C — CROSS-DEVICE hijack attempt ack (deviceId wrong) → 403 Forbidden explicit message, NOT 404
+[ ] Test 11D — Duplicate EXECUTED/FAILED ack sent twice → both 200 OK (idempotent)
+[ ] Test 11E — body.status lowercase (not EXACT enum) → 400 schema strict reject
+[ ] Test 11F — body.deviceId missing → 400 schema reject
+[ ] Test 11G — No auto DrawerMedication quantity change anywhere in #9/#10/#11; No MedicationSession created.
+               Both only occur on /api/devices/medication-events (Test #5). Verify via Supabase SQL:
+               SELECT * FROM "MedicationSession" WHERE createdAt > now() - interval '2 minutes';
+               SELECT * FROM "DrawerMedication" WHERE id = <your_drawerMed_id> RETURNING quantity;
+               quantity unchanged from pre-test value.
+
+DRAWER CLOSE COMMAND (Mobile + Pi new feature):
+[ ] Test 12A — POST drawers/:drawerId/close empty body {} → success message "Drawer close command created successfully", type=CLOSE_DRAWER, status=PENDING, reason=MANUAL default
+[ ] Test 12B — POST close with explicit reason → data.reason trimmed stored correctly
+[ ] Test 12C — drawerRouter POST /:drawerId/close literal route mounted BEFORE generic /:id (so param doesn't hijack "close" string). Same literal-first rule as /open and /:id/sensors.
+[ ] Test 12D — non-owner JWT → 404 (security-by-obscurity, NOT 403)
+[ ] Test 12E — no JWT Bearer → 401 requireAuth
+[ ] Test 12F — nonexistent drawer UUID → 404 NotFoundError
+[ ] Test 12G — MedicineBox.deviceId empty/whitespace → 400 "no deviceId associated" BadRequest
+[ ] Test 12H — reason > 200 chars → 400 schema strict reject
+[ ] Test 12I — extra unknown JSON keys → 400 strict() rejected
+[ ] Close Reuse — GET /devices/:deviceId/commands poll automatically returns CLOSE_DRAWER + OPEN_DRAWER mixed in ASC createdAt order; no new endpoint.
+[ ] Close Reuse — POST /api/devices/commands/:commandId/result ack works identically for CLOSE_DRAWER (EXECUTED increments executedAt/clears error; FAILED stores error/keeps executedAt null; cross-device hijack 403).
+
+REFILL (HARDWARE ENDPOINTS):
+[ ] NOT IMPLEMENTED — mark skipped (see §15 for the exact manual
+                       admin PATCH workaround via drawer-medications)
+
+============================================================
+============================================================
+21. ENVIRONMENT VARIABLES (relevant to device testing, real sources)
+============================================================
+Taken from .env.example + real .env file names. None of these values
+need to be inside Postman variables except PORT.
+
+  NODE_ENV=development
+  PORT=3000
+  (Therefore BASE_URL = http://localhost:3000 is correct.)
+
+  DATABASE_URL=  (Supabase pooler string — must contain ?pgbouncer=true
+                 and pooler password; if backend shows P1001 fix here)
+  DIRECT_URL=    (Supabase direct session string for prisma migrate deploy)
+
+  JWT_SECRET=            (at least 32 chars random; used to sign tokens)
+  JWT_EXPIRES_IN=        (e.g. 24h; default used by JwtService)
+  CORS_ORIGIN=           (comma-sep list; default allows all localhost)
+
+  SUPABASE_URL=          (https://kyxmkhdrnijymlotjynr.supabase.co)
+  SUPABASE_ANON_KEY=     (used only for patient-avatars public bucket)
+
+  SYSTEM_ADMIN_EMAIL=superborgi@med.com
+  SYSTEM_ADMIN_PASSWORD=SecurePassword123!
+  (see prisma/seed-admin.ts; runs with npx prisma:seed idempotent)
+
+  DEVICE_OFFLINE_THRESHOLD_MS=5000
+  #DEVICE_MONITOR_INTERVAL_MS=1000
+  (Control the offline monitor. If a heartbeat is not received within
+   5000ms, deviceStatus becomes OFFLINE. Monitor runs every 1s.)
+
+============================================================
+============================================================
+22. SCOPE SUMMARY — EXACTLY WHAT IS DOCUMENTED / WHAT IS NOT
+============================================================
+Implemented endpoints documented (13 total, real count):
+
+  (A) User / token bootstrap:    1  (POST /api/auth/login)
+  (B) Raspberry Pi device side:  8  (heartbeat POST, face-ref GET,
+                                       face-verification POST,
+                                       /:deviceId/schedule GET,
+                                       medication-events POST,
+                                       sensor-readings POST,
+                                       /:deviceId/commands GET,
+                                       /commands/:id/result POST)
+  (C) Flutter mobile consumer:   4  (medicine-boxes/:id/sensors GET,
+                                       drawers/:id/sensors GET,
+                                       drawers/:drawerId/open POST,
+                                       drawers/:drawerId/close POST)
+  ---
+  TOTAL IMPLEMENTED ENDPOINTS DOCUMENTED:   13
+  (Of which 12 are strictly RPi↔Backend or mobile↔Backend about the
+   device; login is included because it is required to get the JWT
+   for the mobile endpoints.)
+
+Feature groups documented (real count):
+  Group 1 — Device Heartbeat + OFFLINE monitor
+  Group 2 — Face Recognition (ref download + result audit only)
+  Group 3 — Schedule Synchronization
+  Group 4 — Medication Event (TAKEN / MISSED / stock decrement /
+            duplicate idempotent / last-pill -> EMPTY)
+  Group 5 — Sensor POST (DHT11 + fire boolean) + Mobile GET sensors
+  Group 6 — Drawer Physical Operation Command Queue
+            (Flutter enqueue Open + Close drawer commands, Pi poll pending,
+             Pi ack EXECUTED/FAILED result)
+  Group 7 — Refill (partial implementation: command queue table +
+            4 drawer command endpoints are now implemented;
+            REFILL_COMPLETED event endpoint and ADMIN refill POST
+            are still NOT IMPLEMENTED)
+  ---
+  TOTAL FEATURE GROUPS DOCUMENTED:  7
+
+Features FOUND NOT IMPLEMENTED (accurate from full-codebase grep):
+  - POST /api/medicine-boxes/:id/drawers/:drawerId/refill endpoint
+    (ADMIN refill enqueue)
+  - POST /api/devices/events generic event queue endpoint
+    (REFILL_COMPLETED / DRAWER_OPENED / DRAWER_CLOSED / MOTOR_ERROR)
+  - REFILL_COMPLETED handler that increments DrawerMedication.quantity
+    from a pending REFILL command
+  - OPEN_DRAWER REFILL sub-type commands (only manual OPEN_DRAWER
+    command type implemented today; REFILL command type not added
+    to DeviceCommandType enum yet)
+  - Generic command enqueue POST /api/devices/commands (Flutter uses
+    POST /api/drawers/:drawerId/open and POST /api/drawers/:drawerId/close,
+    not a generic endpoint)
+  - Fire-detected push notifications (webhook, FCM, email)
+  - Sensor history table (only current state retained)
+  - X-Device-Id / X-Device-Token header-based middleware device auth
+    (commented stub only in validator; not wired)
+
+Test data sources used (nothing invented):
+  * prisma/seed-admin.ts — SYSTEM_ADMIN credentials
+  * .env.example — PORT=3000, env var names
+  * .env (active) — Supabase project ref kyxmkhdrnijymlotjynr
+  * Prisma schema — every single table/field name in DB verification
+    section, enum values ACTIVE/OFFLINE/EMPTY/LOADED/PATIENT_TAKEN/
+    MISSED, DeviceCommandType/DeviceCommandStatus enums, FK structures.
+  * devices.validator.ts — all JSON payload schemas (verbatim
+    field names, strict, superRefine rules, enums, optionals,
+    max-length rules).
+  * drawer.validator.ts — drawerOpenCommandSchema max 200 reason
+    strict rule.
+  * devices.routes.ts + medicineBox.routes.ts + drawer.routes.ts
+    — real URL patterns / HTTP methods and literal-first ordering
+    (/:drawerId/open positioned BEFORE generic /:id).
+  * DevicesController.ts — response envelope fields and
+    exact response data key names (status/lastSeen/scheduleId/
+    medicationName/drawerIndex/updatedAt/commands[]/commandId etc.)
+  * DrawerController.ts (openDrawer method) — exact response
+    message "Drawer open command created successfully" + data shape
+  * authMiddleware.ts L12–L60 — exact Bearer parsing and 401 messages.
+  * package.json scripts — for dev/migrate/seed commands.
+
+Project files inspected (for READ → VERIFY → DOCUMENT audit trail):
+  prisma/schema.prisma
+  prisma/seed-admin.ts
+  prisma/migrations/* (for model names, column names)
+  prisma/migrations/20260929100000_add_device_command/migration.sql  (migration 0015 DeviceCommand table)
+  prisma/migrations/20260930100000_add_close_drawer_command/migration.sql  (migration 0016 CLOSE_DRAWER enum value)
+  .env.example
+  package.json
+  src/app.ts                       (route mounts)
+  src/server.ts
+  src/presentation/routes/auth.routes.ts
+  src/presentation/routes/devices.routes.ts
+  src/presentation/routes/medicineBox.routes.ts
+  src/presentation/routes/drawer.routes.ts
+  src/presentation/controllers/DevicesController.ts (whole file)
+  src/presentation/controllers/MedicineBoxController.ts  (getSensors)
+  src/presentation/controllers/DrawerController.ts       (getSensors + openDrawer + closeDrawer)
+  src/presentation/controllers/AuthController.ts         (login shape)
+  src/presentation/validators/devices.validator.ts       (all schemas)
+  src/presentation/validators/drawer.validator.ts        (drawerOpenCommandSchema + drawerCloseCommandSchema)
+  src/presentation/middlewares/authMiddleware.ts
+  src/application/services/DeviceOfflineMonitor.ts
+  src/application/use-cases/device/* (use-cases, including 2 new GetPendingDeviceCommands / AcknowledgeDeviceCommandResult)
+  src/application/use-cases/drawer/CreateDrawerOpenCommand.ts
+  src/application/use-cases/drawer/CreateDrawerCloseCommand.ts
+  src/application/use-cases/medicine-box/GetMedicineBoxSensorReadings.ts
+  src/application/use-cases/drawers/GetDrawerSensorReading.ts
+  src/infrastructure/services/PrismaDeviceMedicationEventProcessor.ts
+  src/infrastructure/database/prisma/repositories/* (including PrismaDeviceCommandRepository)
+  src/infrastructure/database/prisma/client.ts
+  src/domain/entities/DeviceCommand.ts                   (interface + types OPEN_DRAWER | CLOSE_DRAWER)
+  src/domain/repositories/IDeviceCommandRepository.ts    (5-method interface)
+  src/shared/constants/index.ts        (HTTP_STATUS numeric values)
+  src/shared/errors/AppError.ts        (error classes & messages)
+  tests/device-heartbeat.spec.ts
+  tests/device-face-recognition.spec.ts
+  tests/device-medication-events.spec.ts
+  tests/device-schedule-sync.spec.ts
+  tests/drawer-sensor.spec.ts
+  tests/drawer-open-command.spec.ts    (13 open tests + 8 close tests = 21 total tests inside)
+  (17 jest suites total, read only to confirm real error message strings
+   used in negative sub-tests above match actual implementation output.)

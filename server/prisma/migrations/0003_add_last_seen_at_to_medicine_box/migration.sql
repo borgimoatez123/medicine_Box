@@ -1,0 +1,1 @@
+ALTER TABLE "MedicineBox" ADD COLUMN "lastSeenAt" TIMESTAMP(3);

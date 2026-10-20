@@ -1,0 +1,9 @@
+-- Baseline migration: represents the existing state of the database BEFORE the MedicineBox
+-- lifecycle/connectivity split. Intentionally empty because the tables and enums already
+-- exist in the Supabase PostgreSQL database.
+--
+-- Tables covered: "User", "Patient", "Medication", "Schedule", "MedicineBox", "Drawer", "DrawerMedication"
+-- Enums covered:  "UserRole", "MedicationForm", "ScheduleStatus", "MedicineBoxStatus", "DrawerStatus"
+--
+-- This migration is marked as "applied" via `prisma migrate resolve --applied 0001_baseline_initial_schema`
+-- so that subsequent migrations (e.g. 0002) can be safely applied on top of the live database.

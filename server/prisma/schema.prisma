@@ -1,0 +1,282 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  USER
+}
+
+enum MedicationForm {
+  TABLET
+  CAPSULE
+  LIQUID
+  INJECTION
+  CREAM
+  POWDER
+  OTHER
+}
+
+enum ScheduleStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  ARCHIVED
+}
+
+enum MedicineBoxStatus {
+  READY
+  ACTIVE
+  MAINTENANCE
+}
+
+enum DeviceStatus {
+  ACTIVE
+  OFFLINE
+}
+
+enum DeviceCommandType {
+  OPEN_DRAWER
+  CLOSE_DRAWER
+}
+
+enum DeviceCommandStatus {
+  PENDING
+  SENT
+  EXECUTED
+  FAILED
+  EXPIRED
+}
+
+enum DrawerStatus {
+  EMPTY
+  LOADED
+  LOCKED
+  DISPENSING
+  ERROR
+}
+
+enum MedicationSessionResult {
+  PATIENT_TAKEN
+  PATIENT_SKIPPED
+  FACE_RECOGNITION_FAILED
+  DISPENSING_FAILED
+  DEVICE_FAILURE
+  MISSED
+}
+
+model User {
+  id           String   @id @default(uuid())
+  firstName    String?
+  lastName     String?
+  email        String   @unique
+  passwordHash String
+  phone        String?
+  role         UserRole @default(USER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  patients      Patient[]
+  medicineBoxes MedicineBox[]
+}
+
+model Patient {
+  id          String    @id @default(uuid())
+  userId      String
+  fullName    String
+  dateOfBirth DateTime?
+  gender      String?
+  weightKg    Decimal?
+  heightCm    Decimal?
+  bloodType   String?
+  allergies   String?
+  notes       String?
+  avatarUrl   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user                   User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  medications            Medication[]
+  medicationSessions     MedicationSession[]
+  faceVerificationEvents FaceVerificationEvent[]
+
+  @@index([userId])
+}
+
+model Medication {
+  id         String         @id @default(uuid())
+  patientId  String
+  name       String
+  dosage     String
+  form       MedicationForm
+  quantity   Int
+  expiryDate DateTime?
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  patient            Patient             @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  schedules          Schedule[]
+  drawerMedication   DrawerMedication?
+  medicationSessions MedicationSession[]
+
+  @@unique([patientId, name, dosage, form, expiryDate])
+  @@index([patientId])
+}
+
+model Schedule {
+  id             String         @id @default(uuid())
+  medicationId   String
+  dosage         String
+  timesPerDay    Int?
+  times          Json?
+  startDate      DateTime
+  endDate        DateTime?
+  daysOfWeek     Json?
+  status         ScheduleStatus @default(ACTIVE)
+  notes          String?
+  refillReminder Boolean        @default(false)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  isActive       Boolean        @default(true)
+
+  medication         Medication          @relation(fields: [medicationId], references: [id], onDelete: Cascade)
+  medicationSessions MedicationSession[]
+
+  @@index([medicationId])
+}
+
+model MedicineBox {
+  id              String            @id @default(uuid())
+  deviceId        String            @unique
+  deviceToken     String
+  name            String
+  status          MedicineBoxStatus @default(READY)
+  deviceStatus    DeviceStatus      @default(OFFLINE)
+  lastSeenAt      DateTime?
+  userId          String?
+  numberOfDrawers Int
+  drawerCapacity  Int
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  user                   User?                   @relation(fields: [userId], references: [id], onDelete: SetNull)
+  drawers                Drawer[]
+  faceVerificationEvents FaceVerificationEvent[] @relation("FaceVerifDeviceLink")
+  commands               DeviceCommand[]
+
+  @@index([userId])
+}
+
+model Drawer {
+  id            String       @id @default(uuid())
+  medicineBoxId String
+  drawerNumber  Int
+  status        DrawerStatus @default(EMPTY)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  medicineBox        MedicineBox         @relation(fields: [medicineBoxId], references: [id], onDelete: Cascade)
+  drawerMedication   DrawerMedication?
+  medicationSessions MedicationSession[]
+  sensorState        DrawerSensorState?
+  commands           DeviceCommand[]
+
+  @@unique([medicineBoxId, drawerNumber])
+  @@index([medicineBoxId])
+}
+
+model DrawerMedication {
+  id              String   @id @default(uuid())
+  drawerId        String   @unique
+  medicationId    String   @unique
+  quantity        Int?
+  missingQuantity Int?
+  assignedAt      DateTime @default(now())
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  drawer     Drawer     @relation(fields: [drawerId], references: [id], onDelete: Cascade)
+  medication Medication @relation(fields: [medicationId], references: [id], onDelete: Cascade)
+}
+
+model MedicationSession {
+  id             String                   @id @default(uuid())
+  scheduleId     String
+  patientId      String
+  medicationId   String
+  drawerId       String
+  scheduledAt    DateTime
+  startedAt      DateTime?
+  completedAt    DateTime?
+  quantityBefore Int
+  quantityAfter  Int?
+  result         MedicationSessionResult?
+  occurrenceDate DateTime?
+  occurrenceTime String?
+
+  schedule   Schedule   @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  patient    Patient    @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  medication Medication @relation(fields: [medicationId], references: [id], onDelete: Cascade)
+  drawer     Drawer     @relation(fields: [drawerId], references: [id], onDelete: Cascade)
+
+  @@index([scheduleId])
+  @@index([patientId])
+  @@index([medicationId])
+  @@index([drawerId])
+  @@index([scheduleId, scheduledAt])
+  @@index([drawerId, completedAt])
+  @@unique([scheduleId, occurrenceDate, occurrenceTime], map: "MedicationSession_schedule_occurrence_unique")
+}
+
+model FaceVerificationEvent {
+  id         String   @id @default(uuid())
+  deviceId   String?
+  patientId  String
+  verified   Boolean
+  similarity Float?
+  timestamp  DateTime @default(now())
+
+  medicineBox MedicineBox? @relation("FaceVerifDeviceLink", fields: [deviceId], references: [deviceId], onDelete: SetNull)
+  patient     Patient      @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, timestamp(sort: Desc)])
+  @@index([patientId, timestamp(sort: Desc)])
+  @@map("FaceVerificationEvent")
+}
+
+model DrawerSensorState {
+  id           String   @id @default(uuid())
+  drawerId     String   @unique
+  temperature  Float?
+  humidity     Float?
+  fireDetected Boolean  @default(false)
+  updatedAt    DateTime @updatedAt
+  createdAt    DateTime @default(now())
+
+  drawer Drawer @relation(fields: [drawerId], references: [id], onDelete: Cascade)
+}
+
+model DeviceCommand {
+  id         String              @id @default(uuid())
+  deviceId   String
+  drawerId   String?
+  type       DeviceCommandType
+  status     DeviceCommandStatus @default(PENDING)
+  reason     String?
+  createdAt  DateTime            @default(now())
+  sentAt     DateTime?
+  executedAt DateTime?
+  error      String?
+
+  medicineBox MedicineBox @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+  drawer      Drawer?     @relation(fields: [drawerId], references: [id], onDelete: SetNull)
+
+  @@index([deviceId, status])
+  @@index([drawerId, createdAt])
+}
