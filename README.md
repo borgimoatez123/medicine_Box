@@ -731,7 +731,7 @@ Add the project contributors and their GitHub profiles here.
 
 - **Project Team:** Smart Medicine Box Development Team
 - **Institution:** ESPRIT, Tunisia
-- **Project Type:** Engineering Project / PFE
+- **Project Type:** Engineering Project / PFA
 
 ---
 
