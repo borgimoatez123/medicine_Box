@@ -1,0 +1,3 @@
+borgimoatez@raspberrypi:~ $ source ~/.venv/bin/activate
+(.venv) borgimoatez@raspberrypi:~ $ cd ~
+(.venv) borgimoatez@raspberrypi:~ $ python test_oled_views.py
